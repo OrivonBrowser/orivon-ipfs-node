@@ -193,7 +193,7 @@ fn verdict(
     }
 }
 
-fn is_circuit(addr: &Multiaddr) -> bool {
+pub(crate) fn is_circuit(addr: &Multiaddr) -> bool {
     addr.iter().any(|part| matches!(part, Protocol::P2pCircuit))
 }
 

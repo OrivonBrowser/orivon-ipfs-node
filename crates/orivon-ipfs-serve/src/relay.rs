@@ -214,6 +214,7 @@ impl Relays {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p2p::is_circuit;
 
     const RELAY: &str = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
     const OTHER: &str = "12D3KooWJdw4Tux8MAkbsVY6nLNtLnM25jS2EGNC7AFiJRQ6H7Cu";
