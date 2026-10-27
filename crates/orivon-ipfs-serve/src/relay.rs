@@ -50,10 +50,6 @@ pub(crate) fn parse_relays(
     Ok(relays)
 }
 
-fn is_circuit(addr: &Multiaddr) -> bool {
-    addr.iter().any(|part| matches!(part, Protocol::P2pCircuit))
-}
-
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.min(7)).min(MAX_BACKOFF)
 }
