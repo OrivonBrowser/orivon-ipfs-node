@@ -11,6 +11,7 @@ use crate::p2p::{
     KAD_QUERY_TIMEOUT, MAX_CONNECTIONS_PER_PEER, MAX_INBOUND_CONNECTIONS, MAX_OUTBOUND_CONNECTIONS, MAX_PENDING_INBOUND,
 };
 use crate::provide::AddOutcome;
+use crate::relay::parse_relays;
 use cid::Cid;
 use futures::stream::select_all;
 use futures::{AsyncWriteExt, StreamExt};
@@ -21,6 +22,7 @@ use libp2p::core::upgrade::Version as UpgradeVersion;
 use libp2p::identity::Keypair;
 use libp2p::kad::{self, store::MemoryStore, store::MemoryStoreConfig};
 use libp2p::multiaddr::Protocol;
+use libp2p::relay;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{connection_limits, identify, noise, ping, yamux, Multiaddr, PeerId, Transport};
@@ -148,7 +150,11 @@ impl ServeNode {
     ) -> Result<Self, StartError> {
         let keypair = Keypair::generate_ed25519();
         let peer_id = keypair.public().to_peer_id();
-        let mut swarm = build_swarm(&keypair, allow_local, p2p.as_ref()).await?;
+        let relays = match &p2p {
+            Some(config) => parse_relays(&config.relays, allow_local).map_err(StartError)?,
+            None => Vec::new(),
+        };
+        let mut swarm = build_swarm(&keypair, allow_local, p2p.as_ref(), !relays.is_empty()).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let mut incoming = Vec::new();
         for version in Version::all() {
@@ -160,7 +166,7 @@ impl ServeNode {
         let features = p2p.as_ref().map(P2pConfig::features);
         let provides = p2p.as_ref().is_some_and(|config| config.dht.is_some());
         let p2p_state = match &p2p {
-            Some(config) => Some(start_listening(&mut swarm, config, allow_local)?),
+            Some(config) => Some(start_listening(&mut swarm, config, allow_local, relays)?),
             None => None,
         };
         let (commands, receiver) = mpsc::channel(32);
@@ -249,6 +255,7 @@ fn start_listening(
     swarm: &mut libp2p::Swarm<Behaviour>,
     config: &P2pConfig,
     allow_local: bool,
+    relays: Vec<(PeerId, Multiaddr)>,
 ) -> Result<P2p, StartError> {
     let v4: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.port)
         .parse()
@@ -290,7 +297,10 @@ fn start_listening(
     if config.assume_public {
         swarm.add_external_address(assumed_address(config.port));
     }
-    Ok(P2p::new(config, allow_local, accepted, Instant::now()))
+    let now = Instant::now();
+    let mut p2p = P2p::new(config, allow_local, accepted, relays, now);
+    p2p.listen_relays(swarm, now);
+    Ok(p2p)
 }
 
 #[derive(NetworkBehaviour)]
@@ -303,12 +313,14 @@ pub(crate) struct Behaviour {
     pub(crate) keepalive: Toggle<keepalive::Behaviour>,
     pub(crate) kad: Toggle<kad::Behaviour<MemoryStore>>,
     pub(crate) autonat: Toggle<autonat::v1::Behaviour>,
+    pub(crate) relay_client: Toggle<relay::client::Behaviour>,
 }
 
 async fn build_swarm(
     keypair: &Keypair,
     allow_local: bool,
     p2p: Option<&P2pConfig>,
+    relays: bool,
 ) -> Result<libp2p::Swarm<Behaviour>, StartError> {
     let noise_config = noise::Config::new(keypair).map_err(|err| StartError(err.to_string()))?;
     let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
@@ -332,9 +344,26 @@ async fn build_swarm(
     #[cfg(not(target_os = "wasi"))]
     let transport = dns::tokio::Transport::system(tcp_transport)
         .map_err(|err| StartError(err.to_string()))?;
+    let local_peer = keypair.public().to_peer_id();
+    // A relay client turns `<relay>/p2p/<id>/p2p-circuit` into a place to listen, through a
+    // reservation on that relay; its transport is tried before the direct one.
+    let (transport, relay_client) = if relays {
+        let (relay_transport, relay_client) = relay::client::new(local_peer);
+        let relay_transport = relay_transport
+            .upgrade(UpgradeVersion::V1Lazy)
+            .authenticate(noise::Config::new(keypair).map_err(|err| StartError(err.to_string()))?)
+            .multiplex(yamux::Config::default())
+            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+        let transport = relay_transport
+            .or_transport(transport)
+            .map(|either, _| either.into_inner())
+            .boxed();
+        (transport, Some(relay_client))
+    } else {
+        (transport.boxed(), None)
+    };
     let transport = TransportTimeout::new(transport, TRANSPORT_TIMEOUT).boxed();
 
-    let local_peer = keypair.public().to_peer_id();
     let dht = p2p.is_some_and(|config| config.dht.is_some());
     let limits = match p2p {
         None => connection_limits::ConnectionLimits::default()
@@ -366,6 +395,7 @@ async fn build_swarm(
                 autonat::v1::Behaviour::new(local_peer, autonat_config)
             })
             .into(),
+        relay_client: relay_client.into(),
     };
     let config = libp2p::swarm::Config::with_executor(|future| {
         tokio::spawn(future);

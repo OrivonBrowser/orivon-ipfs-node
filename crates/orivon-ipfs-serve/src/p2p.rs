@@ -2,8 +2,8 @@
 //! reached from outside, and announces the CIDs it was asked to provide on the DHT.
 //!
 //! [`P2pConfig`] is what the node is started with. `P2p` is the state the swarm loop keeps:
-//! the addresses the swarm listens on and has confirmed, the reachability AutoNAT reports, and
-//! the announcements ([`Provided`]).
+//! the addresses the swarm listens on and has confirmed, the reachability AutoNAT reports, the
+//! relay reservations ([`Relays`]) and the announcements ([`Provided`]).
 
 use crate::addr::{candidate_from_observed, ipv4_is_public, ipv6_is_public, Observations};
 use crate::node::{Behaviour, BehaviourEvent};
@@ -11,6 +11,7 @@ use crate::provide::{
     provider_key, AddOutcome, Provided, ProvidingEntry, Reachability, TooMany, MAX_ANNOUNCING,
     REANNOUNCE_EVERY,
 };
+use crate::relay::Relays;
 use cid::Cid;
 use libp2p::autonat;
 use libp2p::kad::{self, QueryId, QueryResult, RecordKey};
@@ -55,6 +56,9 @@ pub struct P2pConfig {
     /// A DHT client and reachability detection; without it the node accepts connections and
     /// announces nothing.
     pub dht: Option<DhtConfig>,
+    /// Circuit relays to hold a reservation on, each `<address>/p2p/<relay id>`. While one holds
+    /// a reservation the node announces its circuit address, whatever AutoNAT says.
+    pub relays: Vec<String>,
     pub reannounce_every: Duration,
     /// Different peers that must report an address before AutoNAT tests it.
     pub min_observations: usize,
@@ -68,6 +72,7 @@ impl P2pConfig {
         Self {
             port,
             dht: None,
+            relays: Vec::new(),
             reannounce_every: REANNOUNCE_EVERY,
             min_observations: MIN_OBSERVATIONS,
             autonat: autonat::v1::Config {
@@ -87,6 +92,11 @@ impl P2pConfig {
         self
     }
 
+    pub fn with_relays(mut self, relays: Vec<String>) -> Self {
+        self.relays = relays;
+        self
+    }
+
     pub fn with_assume_public(mut self) -> Self {
         self.assume_public = true;
         self
@@ -94,10 +104,11 @@ impl P2pConfig {
 
     /// The value of the `x-orivon-node-features` header.
     pub fn features(&self) -> &'static str {
-        if self.dht.is_some() {
-            "serve,listen,provide"
-        } else {
-            "serve,listen"
+        match (self.dht.is_some(), !self.relays.is_empty()) {
+            (false, false) => "serve,listen",
+            (true, false) => "serve,listen,provide",
+            (false, true) => "serve,listen,relay",
+            (true, true) => "serve,listen,provide,relay",
         }
     }
 }
@@ -126,6 +137,9 @@ pub struct NodeStatus {
     pub peer: PeerId,
     pub listen: Vec<Multiaddr>,
     pub external: Vec<Multiaddr>,
+    /// The circuit addresses relays hold a reservation for, each
+    /// `<relay address>/p2p/<relay id>/p2p-circuit/p2p/<peer>`: complete, so a peer can dial it.
+    pub relays: Vec<Multiaddr>,
     pub reachability: Reachability,
     pub providing: Vec<ProvidingEntry>,
 }
@@ -154,7 +168,7 @@ pub(crate) fn assumed_address(port: u16) -> Multiaddr {
 }
 
 /// `addr` without a trailing `/p2p/<peer id>`, which AutoNAT adds to the address it confirms.
-fn without_peer(addr: &Multiaddr) -> Multiaddr {
+pub(crate) fn without_peer(addr: &Multiaddr) -> Multiaddr {
     let mut addr = addr.clone();
     if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
         addr.pop();
@@ -177,6 +191,10 @@ fn verdict(
         Some(autonat::v1::NatStatus::Private) => Reachability::Private,
         _ => Reachability::Unknown,
     }
+}
+
+pub(crate) fn is_circuit(addr: &Multiaddr) -> bool {
+    addr.iter().any(|part| matches!(part, Protocol::P2pCircuit))
 }
 
 /// An address worth giving the routing table: a bare TCP address on a public IP (or any IP when
@@ -207,6 +225,7 @@ pub(crate) struct P2p {
     announcing: HashMap<QueryId, Cid>,
     observations: Observations,
     autonat_servers: HashSet<PeerId>,
+    relays: Relays,
     next_bootstrap: Instant,
 }
 
@@ -215,6 +234,7 @@ impl P2p {
         config: &P2pConfig,
         allow_local: bool,
         wildcard: Vec<Multiaddr>,
+        relays: Vec<(PeerId, Multiaddr)>,
         now: Instant,
     ) -> Self {
         let mut provided = Provided::new(config.reannounce_every);
@@ -241,8 +261,14 @@ impl P2p {
             announcing: HashMap::new(),
             observations: Observations::new(config.min_observations),
             autonat_servers: HashSet::new(),
+            relays: Relays::new(relays, now),
             next_bootstrap: now + KAD_BOOTSTRAP_EVERY,
         }
+    }
+
+    /// Asks every relay for a reservation. Without it the first ask waits for the next tick.
+    pub(crate) fn listen_relays(&mut self, swarm: &mut Swarm<Behaviour>, now: Instant) {
+        self.relays.listen(swarm, now);
     }
 
     pub(crate) fn provide(&mut self, cid: Cid, now: Instant) -> Result<AddOutcome, ProvideError> {
@@ -278,6 +304,7 @@ impl P2p {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
+            relays: self.relays.held(),
             reachability: self.reachability,
             providing: self.provided.snapshot(),
         }
@@ -290,9 +317,18 @@ impl P2p {
         now: Instant,
     ) {
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::debug!(%address, "listening");
-                self.listen.insert(address.clone());
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                // A reservation's circuit address is reported in `relays`, not as a place the
+                // swarm listens.
+                if self.relays.owns(*listener_id) {
+                    tracing::debug!(%address, "relay listener address");
+                } else {
+                    tracing::debug!(%address, "listening");
+                    self.listen.insert(address.clone());
+                }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 self.listen.remove(address);
@@ -301,11 +337,30 @@ impl P2p {
                 tracing::warn!(%error, "listener error");
             }
             SwarmEvent::ListenerClosed {
-                addresses, reason, ..
+                listener_id,
+                addresses,
+                reason,
             } => {
+                if self.relays.closed(swarm, *listener_id, reason, now) {
+                    self.sync_relayed(now);
+                    return;
+                }
                 tracing::warn!(?addresses, ?reason, "listener closed");
                 for address in addresses {
                     self.listen.remove(address);
+                }
+            }
+            SwarmEvent::ExternalAddrConfirmed { address } if is_circuit(address) => {
+                if self.relays.confirmed(address, now) {
+                    tracing::info!(%address, "relay reservation accepted");
+                    self.sync_relayed(now);
+                    self.provided.address_added(now);
+                }
+            }
+            SwarmEvent::ExternalAddrExpired { address } if is_circuit(address) => {
+                if self.relays.expired(address) {
+                    tracing::info!(%address, "relay reservation ended");
+                    self.sync_relayed(now);
                 }
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -396,6 +451,12 @@ impl P2p {
         }
     }
 
+    /// Tells the announcements whether a relay holds a reservation: a circuit address works for
+    /// a peer whatever AutoNAT says about a direct connection.
+    fn sync_relayed(&mut self, now: Instant) {
+        self.provided.set_relayed(self.relays.active(), now);
+    }
+
     /// Takes AutoNAT's verdict as the node's reachability. A private verdict drops the addresses it
     /// had confirmed, so nothing is announced that no one can reach.
     fn sync_reachability(&mut self, swarm: &mut Swarm<Behaviour>, now: Instant) {
@@ -424,6 +485,7 @@ impl P2p {
 
     /// Once a second: starts the announcements that are due and refreshes the routing table.
     pub(crate) fn tick(&mut self, swarm: &mut Swarm<Behaviour>, now: Instant) {
+        self.relays.listen(swarm, now);
         self.sync_reachability(swarm, now);
         if !self.dht {
             return;
@@ -537,6 +599,23 @@ mod tests {
             P2pConfig::new(4801).with_dht(vec![]).features(),
             "serve,listen,provide"
         );
+    }
+
+    #[test]
+    fn a_relay_adds_its_feature_after_the_others() {
+        let relay = vec!["/ip4/93.184.216.34/tcp/4001/p2p/x".to_string()];
+        assert_eq!(
+            P2pConfig::new(4801).with_relays(relay.clone()).features(),
+            "serve,listen,relay"
+        );
+        assert_eq!(
+            P2pConfig::new(4801)
+                .with_dht(vec![])
+                .with_relays(relay)
+                .features(),
+            "serve,listen,provide,relay"
+        );
+        assert_eq!(P2pConfig::new(4801).with_relays(vec![]).features(), "serve,listen");
     }
 
     #[test]

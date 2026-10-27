@@ -28,7 +28,7 @@ clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
 futures = "0.3"
 http = "1"
-libp2p = { version = "0.56", default-features = false, features = ["autonat", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "quic", "rsa", "tcp", "tls", "tokio", "websocket", "yamux"] }
+libp2p = { version = "0.56", default-features = false, features = ["autonat", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "quic", "relay", "rsa", "tcp", "tls", "tokio", "websocket", "yamux"] }
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand", "rsa"] }
 libp2p-stream = "0.4.0-alpha"
 mime_guess = "2"

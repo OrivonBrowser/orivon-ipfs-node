@@ -9083,6 +9083,10 @@ struct BitswapBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     limits: connection_limits::Behaviour,
+    // Lets a provider whose only address is `<relay>/p2p/<relay id>/p2p-circuit/p2p/<peer id>` be
+    // dialed: the transport below opens a circuit through the relay and this behaviour dials the
+    // relay for it.
+    relay_client: libp2p::relay::client::Behaviour,
 }
 
 fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
@@ -9092,7 +9096,10 @@ fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established(Some(BITSWAP_MAX_ESTABLISHED_CONNECTIONS))
 }
 
-fn bitswap_behaviour(public_key: libp2p::identity::PublicKey) -> BitswapBehaviour {
+fn bitswap_behaviour(
+    public_key: libp2p::identity::PublicKey,
+    relay_client: libp2p::relay::client::Behaviour,
+) -> BitswapBehaviour {
     BitswapBehaviour {
         stream: libp2p_stream::Behaviour::new(),
         identify: identify::Behaviour::new(identify::Config::new(
@@ -9101,6 +9108,7 @@ fn bitswap_behaviour(public_key: libp2p::identity::PublicKey) -> BitswapBehaviou
         )),
         ping: ping::Behaviour::new(ping::Config::new()),
         limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
+        relay_client,
     }
 }
 
@@ -9120,7 +9128,12 @@ async fn build_bitswap_swarm() -> Result<libp2p::Swarm<BitswapBehaviour>> {
         // builder's system-DNS websocket shortcut.
         .with_other_transport(cloudflare_websocket_transport)
         .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
-        .with_behaviour(|key| bitswap_behaviour(key.public()))
+        .with_relay_client(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
+        .with_behaviour(|key, relay_client| bitswap_behaviour(key.public(), relay_client))
         .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT))
         .with_connection_timeout(BITSWAP_CONNECTION_TIMEOUT)
@@ -9157,6 +9170,19 @@ async fn build_bitswap_swarm() -> Result<libp2p::Swarm<BitswapBehaviour>> {
         orivon_ipfs_dns::tcp_resolver_config(),
         dns::ResolverOpts::default(),
     );
+    // The same noise and yamux upgrades over a circuit; the relay transport is tried first and
+    // passes every address that is not a circuit address on to the TCP one.
+    let (relay_transport, relay_client) = libp2p::relay::client::new(local_peer_id);
+    let relay_transport = relay_transport
+        .upgrade(Version::V1Lazy)
+        .authenticate(
+            noise::Config::new(&keypair).map_err(|err| RetrievalError::Bitswap(err.to_string()))?,
+        )
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let transport = relay_transport
+        .or_transport(transport)
+        .map(|either, _| either.into_inner());
     let transport = TransportTimeout::new(transport, BITSWAP_CONNECTION_TIMEOUT).boxed();
 
     let swarm_cfg = libp2p::swarm::Config::with_executor(|fut| {
@@ -9166,7 +9192,7 @@ async fn build_bitswap_swarm() -> Result<libp2p::Swarm<BitswapBehaviour>> {
 
     Ok(libp2p::Swarm::new(
         transport,
-        bitswap_behaviour(keypair.public()),
+        bitswap_behaviour(keypair.public(), relay_client),
         local_peer_id,
         swarm_cfg,
     ))
@@ -9582,6 +9608,7 @@ fn bitswap_transport_label(addr: &Multiaddr) -> &'static str {
     let mut has_tcp = false;
     for protocol in addr.iter() {
         match protocol {
+            Protocol::P2pCircuit => return "relay",
             Protocol::Wss(_) => return "wss",
             Protocol::Ws(_) => return "ws",
             Protocol::Quic | Protocol::QuicV1 => return "quic",
@@ -10116,16 +10143,33 @@ fn parse_peer_id(id: &str) -> Option<PeerId> {
     PeerId::from_str(id).ok()
 }
 
+/// True for `<relay address>/p2p/<relay id>/p2p-circuit`, with the provider's own `/p2p/<peer id>`
+/// after it or not: the form the relay client dials. A circuit address that leaves out the
+/// relay's address or its id gives it nothing to connect to.
+fn bitswap_circuit_addr_is_dialable(addr: &Multiaddr) -> bool {
+    let protocols: Vec<Protocol> = addr.iter().collect();
+    let Some(circuit) = protocols
+        .iter()
+        .position(|protocol| matches!(protocol, Protocol::P2pCircuit))
+    else {
+        return false;
+    };
+    let relay_named = circuit >= 2 && matches!(protocols[circuit - 1], Protocol::P2p(_));
+    let tail_ok = matches!(&protocols[circuit + 1..], [] | [Protocol::P2p(_)]);
+    relay_named && tail_ok
+}
+
 fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrRejection> {
     let mut has_tcp = false;
     let mut has_udp = false;
     let mut has_quic = false;
+    let mut has_circuit = false;
     for protocol in addr.iter() {
         match protocol {
             Protocol::Tcp(_) => has_tcp = true,
             Protocol::Udp(_) => has_udp = true,
             Protocol::Quic | Protocol::QuicV1 => has_quic = true,
-            Protocol::P2pCircuit => return Some(BitswapAddrRejection::Relay),
+            Protocol::P2pCircuit => has_circuit = true,
             Protocol::WebTransport => return Some(BitswapAddrRejection::WebTransport),
             Protocol::WebRTC | Protocol::WebRTCDirect | Protocol::P2pWebRtcDirect => {
                 return Some(BitswapAddrRejection::WebRtc);
@@ -10133,6 +10177,9 @@ fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrReject
             Protocol::Certhash(_) => return Some(BitswapAddrRejection::Certhash),
             _ => {}
         }
+    }
+    if has_circuit && !bitswap_circuit_addr_is_dialable(addr) {
+        return Some(BitswapAddrRejection::Relay);
     }
     if has_tcp || (has_udp && has_quic) {
         None
@@ -10166,6 +10213,8 @@ fn bitswap_addr_score(addr: &Multiaddr) -> u8 {
 
     for protocol in addr.iter() {
         match protocol {
+            // A circuit costs a connection to the relay first: after every direct address.
+            Protocol::P2pCircuit => return 6,
             Protocol::Ip4(_) | Protocol::Ip6(_) => has_ip = true,
             Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
                 has_dns = true
@@ -11782,6 +11831,65 @@ mod bitswap_tests {
         );
     }
 
+    #[test]
+    fn accepts_a_circuit_bitswap_multiaddr_that_names_the_relay() {
+        let relay = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
+        let target = "12D3KooWJdw4Tux8MAkbsVY6nLNtLnM25jS2EGNC7AFiJRQ6H7Cu";
+        let target_peer = parse_peer_id(target);
+        let relayed = format!("/ip4/164.92.225.198/tcp/4001/p2p/{relay}/p2p-circuit");
+
+        let (peer, addr) =
+            parse_bitswap_multiaddr(&format!("{relayed}/p2p/{target}"), None).unwrap();
+        assert_eq!(Some(peer), target_peer);
+        assert_eq!(addr.to_string(), relayed);
+
+        let (peer, addr) = parse_bitswap_multiaddr(&relayed, target_peer).unwrap();
+        assert_eq!(Some(peer), target_peer);
+        assert_eq!(addr.to_string(), relayed);
+
+        let (peer, addr) = parse_bitswap_multiaddr(
+            &format!("/dns4/relay.example/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(Some(peer), target_peer);
+        assert_eq!(
+            addr.to_string(),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay}/p2p-circuit")
+        );
+    }
+
+    #[test]
+    fn rejects_a_circuit_bitswap_multiaddr_the_relay_client_cannot_dial() {
+        let relay = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
+        let target = "12D3KooWJdw4Tux8MAkbsVY6nLNtLnM25jS2EGNC7AFiJRQ6H7Cu";
+        for addr in [
+            // The relay's id, or its address, is missing.
+            format!("/ip4/164.92.225.198/tcp/4001/p2p-circuit/p2p/{target}"),
+            format!("/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            // A circuit through a circuit, and something after the target.
+            format!("/ip4/164.92.225.198/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/164.92.225.198/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}/tcp/4001"),
+            // A relay this node has no transport for.
+            format!("/ip4/164.92.225.198/udp/4001/quic-v1/webtransport/p2p/{relay}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/164.92.225.198/udp/4001/webrtc-direct/p2p/{relay}/p2p-circuit/p2p/{target}"),
+        ] {
+            assert!(parse_bitswap_multiaddr(&addr, None).is_none(), "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_circuit_address_ranks_after_every_direct_one_and_is_labelled_relay() {
+        let relay = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
+        let circuit: Multiaddr = format!("/ip4/164.92.225.198/tcp/4001/p2p/{relay}/p2p-circuit")
+            .parse()
+            .unwrap();
+        let wss_by_name: Multiaddr = "/dns4/example.com/tcp/443/wss".parse().unwrap();
+        assert!(bitswap_addr_score(&circuit) > bitswap_addr_score(&wss_by_name));
+        assert!(bitswap_addr_score(&circuit) < 9, "better than an unknown address");
+        assert_eq!(bitswap_transport_label(&circuit), "relay");
+    }
+
     #[tokio::test]
     async fn reports_bitswap_provider_address_quality() {
         let peer = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
@@ -13218,6 +13326,39 @@ mod bitswap_tests {
             .unwrap()
             .unwrap();
         swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetches_block_from_a_peer_whose_only_address_is_a_circuit_through_a_relay() {
+        let data = b"bitswap block behind a circuit relay";
+        let cid = orivon_ipfs_core::cid_from_data(orivon_ipfs_core::CODEC_RAW, data);
+        let (relay_peer, relay_addr, relay_task) = spawn_relay_server().await;
+        let (peer_id, circuit, swarm_task, stream_task) =
+            spawn_relayed_bitswap_peer(relay_peer, relay_addr, cid, data.to_vec()).await;
+        assert!(circuit.iter().any(|part| matches!(part, Protocol::P2pCircuit)));
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            orivon_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![circuit.to_string()]).unwrap();
+
+        let (block, source) = retriever
+            .fetch_from_providers_with_source(&cid, &[provider], None)
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), data);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+        tokio::time::timeout(Duration::from_secs(5), stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        swarm_task.abort();
+        relay_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -18212,6 +18353,158 @@ mod bitswap_tests {
         });
 
         (peer_id, addr, swarm_task, stream_task)
+    }
+
+    /// A circuit relay v2 server on the loopback interface, with limits no test comes near.
+    async fn spawn_relay_server() -> (PeerId, Multiaddr, tokio::task::JoinHandle<()>) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|key| {
+                libp2p::relay::Behaviour::new(
+                    key.public().to_peer_id(),
+                    libp2p::relay::Config {
+                        max_reservations: 64,
+                        max_reservations_per_peer: 8,
+                        reservation_duration: Duration::from_secs(60 * 60),
+                        reservation_rate_limiters: Vec::new(),
+                        max_circuits: 64,
+                        max_circuits_per_peer: 8,
+                        max_circuit_duration: Duration::from_secs(60 * 60),
+                        max_circuit_bytes: 1 << 40,
+                        circuit_src_rate_limiters: Vec::new(),
+                    },
+                )
+            })
+            .unwrap()
+            .with_swarm_config(|config| {
+                config.with_idle_connection_timeout(Duration::from_secs(60))
+            })
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+        swarm.add_external_address(addr.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        (peer_id, addr, task)
+    }
+
+    /// Like `spawn_local_bitswap_peer`, but the peer is only reachable through the relay: it
+    /// holds a reservation and returns its circuit address.
+    async fn spawn_relayed_bitswap_peer(
+        relay_peer: PeerId,
+        relay_addr: Multiaddr,
+        cid: Cid,
+        data: Vec<u8>,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        #[derive(NetworkBehaviour)]
+        #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+        struct RelayedPeer {
+            relay_client: libp2p::relay::client::Behaviour,
+            stream: libp2p_stream::Behaviour,
+        }
+
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_relay_client(
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_key, relay_client| RelayedPeer {
+                relay_client,
+                stream: libp2p_stream::Behaviour::new(),
+            })
+            .unwrap()
+            .with_swarm_config(|config| {
+                config.with_idle_connection_timeout(Duration::from_secs(60))
+            })
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        let mut control = swarm.behaviour().stream.new_control();
+        let mut incoming = control
+            .accept(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+            .unwrap();
+        swarm
+            .listen_on(
+                relay_addr
+                    .with(Protocol::P2p(relay_peer))
+                    .with(Protocol::P2pCircuit),
+            )
+            .unwrap();
+        let circuit = loop {
+            if let libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        let stream_task = tokio::spawn(async move {
+            let (_peer, mut stream) = incoming.next().await.unwrap();
+            let want_bytes = read_length_prefixed(&mut stream, 1024).await.unwrap();
+            let want = BitswapMessage::decode(want_bytes.as_slice()).unwrap();
+            let entry = want.wantlist.unwrap().entries.remove(0);
+            assert_eq!(entry.block, cid.to_bytes());
+            assert!(!entry.cancel);
+
+            let response = BitswapMessage {
+                payload: vec![BlockPayload {
+                    prefix: bitswap_payload_prefix(&cid),
+                    data,
+                    tokens: Vec::new(),
+                }],
+                ..BitswapMessage::default()
+            };
+            write_length_prefixed(&mut stream, &response.encode_to_vec())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let cancel_bytes = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_length_prefixed(&mut stream, 1024),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let cancel = BitswapMessage::decode(cancel_bytes.as_slice()).unwrap();
+            assert!(cancel.wantlist.unwrap().entries.remove(0).cancel);
+        });
+
+        (peer_id, circuit, swarm_task, stream_task)
     }
 
     async fn spawn_bitswap_peer_with_extra_payload(

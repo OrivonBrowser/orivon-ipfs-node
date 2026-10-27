@@ -1541,6 +1541,8 @@ struct DhtBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     limits: connection_limits::Behaviour,
+    // Lets a lookup follow a provider or peer whose only address runs through a circuit relay.
+    relay_client: libp2p::relay::client::Behaviour,
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -1561,7 +1563,14 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
             libp2p::dns::ResolverConfig::cloudflare(),
             libp2p::dns::ResolverOpts::default(),
         )
-        .with_behaviour(move |key| dht_behaviour(key.public(), query_timeout))
+        .with_relay_client(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .map_err(|err| RoutingError::Dht(err.to_string()))?
+        .with_behaviour(move |key, relay_client| {
+            dht_behaviour(key.public(), query_timeout, relay_client)
+        })
         .map_err(|err| RoutingError::Dht(err.to_string()))
         .map(|builder| {
             builder
@@ -1612,6 +1621,19 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
         orivon_ipfs_dns::tcp_resolver_config(),
         dns::ResolverOpts::default(),
     );
+    // The same noise and yamux upgrades over a circuit; the relay transport is tried first and
+    // passes every address that is not a circuit address on to the TCP one.
+    let (relay_transport, relay_client) = libp2p::relay::client::new(local_peer_id);
+    let relay_transport = relay_transport
+        .upgrade(Version::V1Lazy)
+        .authenticate(
+            noise::Config::new(&keypair).map_err(|err| RoutingError::Dht(err.to_string()))?,
+        )
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let transport = relay_transport
+        .or_transport(transport)
+        .map(|either, _| either.into_inner());
     let transport = TransportTimeout::new(transport, DHT_CONNECTION_TIMEOUT).boxed();
 
     let swarm_cfg = libp2p::swarm::Config::with_executor(|fut| {
@@ -1621,13 +1643,17 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
 
     Ok(libp2p::Swarm::new(
         transport,
-        dht_behaviour(keypair.public(), query_timeout),
+        dht_behaviour(keypair.public(), query_timeout, relay_client),
         local_peer_id,
         swarm_cfg,
     ))
 }
 
-fn dht_behaviour(public_key: libp2p::identity::PublicKey, query_timeout: Duration) -> DhtBehaviour {
+fn dht_behaviour(
+    public_key: libp2p::identity::PublicKey,
+    query_timeout: Duration,
+    relay_client: libp2p::relay::client::Behaviour,
+) -> DhtBehaviour {
     let peer_id = public_key.to_peer_id();
     let store = MemoryStore::new(peer_id);
     let mut config = kad::Config::new(kad::PROTOCOL_NAME);
@@ -1643,6 +1669,7 @@ fn dht_behaviour(public_key: libp2p::identity::PublicKey, query_timeout: Duratio
         )),
         ping: ping::Behaviour::new(ping::Config::new()),
         limits: connection_limits::Behaviour::new(dht_connection_limits()),
+        relay_client,
     }
 }
 

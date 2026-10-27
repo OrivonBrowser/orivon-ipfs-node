@@ -95,6 +95,13 @@ struct Args {
     /// and `GET /status`, and the `x-orivon-node-features` header on `/health`.
     #[arg(long, requires = "serve", value_parser = clap::value_parser!(u16).range(1..))]
     p2p_port: Option<u16>,
+    /// A circuit relay v2 to hold a reservation on, `<address>/p2p/<relay id>` with `<address>`
+    /// of the form `/ip4|ip6|dns4|dns6/<host>/tcp/<port>`. Repeat it for more relays. While a
+    /// relay holds a reservation the node announces its circuit address, even when AutoNAT says
+    /// the computer cannot be reached directly. Adds `relay` to `x-orivon-node-features` and
+    /// `relays` to `GET /status`.
+    #[arg(long, requires = "p2p_port", value_name = "MULTIADDR", value_parser = parse_relay)]
+    relay: Vec<String>,
     /// `<address>/p2p/<peer id>,...` the DHT starts from instead of the public bootstrap peers.
     /// For tests only.
     #[arg(long, hide = true, requires = "p2p_port", value_delimiter = ',')]
@@ -104,7 +111,7 @@ struct Args {
 /// The listener and DHT settings for `--p2p-port`. The DHT needs the node online with a routing
 /// mode that includes the DHT; otherwise the node only accepts connections.
 fn p2p_config(args: &Args) -> Option<P2pConfig> {
-    let mut config = P2pConfig::new(args.p2p_port?);
+    let mut config = P2pConfig::new(args.p2p_port?).with_relays(args.relay.clone());
     if should_start_online_gateway(args)
         && matches!(args.routing_mode, RoutingMode::Auto | RoutingMode::LightDht)
     {
@@ -116,6 +123,11 @@ fn p2p_config(args: &Args) -> Option<P2pConfig> {
         config = config.with_dht(bootstrap);
     }
     Some(config)
+}
+
+/// The shape of a relay address; whether it is public is checked when the node starts.
+fn parse_relay(value: &str) -> Result<String, String> {
+    orivon_ipfs_serve::parse_relay_addr(value, true).map(|_| value.to_string())
 }
 
 fn parse_api_key(value: &str) -> Result<String, String> {
@@ -441,6 +453,27 @@ mod tests {
         assert_eq!(parse(&["--serve", "--p2p-port", "4801"]).unwrap().p2p_port, Some(4801));
         assert_eq!(parse(&["--serve"]).unwrap().p2p_port, None);
         assert!(parse(&["--serve", "--test-bootstrap", "/ip4/1.2.3.4/tcp/1/p2p/x"]).is_err(), "needs --p2p-port");
+    }
+
+    #[test]
+    fn relay_needs_a_listener_and_a_tcp_address_with_the_relay_id() {
+        let key = "ab".repeat(32);
+        let relay = "/ip4/93.184.216.34/tcp/4001/p2p/12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
+        let other = "/dns4/relay.example/tcp/443/p2p/12D3KooWJdw4Tux8MAkbsVY6nLNtLnM25jS2EGNC7AFiJRQ6H7Cu";
+        let parse = |extra: &[&str]| {
+            let mut all = vec!["orivon-ipfs-gateway", "--serve", "--api-key", &key];
+            all.extend_from_slice(extra);
+            Args::try_parse_from(all)
+        };
+        assert!(parse(&["--relay", relay]).is_err(), "needs --p2p-port");
+        assert!(parse(&["--p2p-port", "4801", "--relay", "/ip4/93.184.216.34/tcp/4001"]).is_err());
+        assert!(parse(&["--p2p-port", "4801", "--relay", "not an address"]).is_err());
+        assert!(parse(&["--p2p-port", "4801", "--relay"]).is_err());
+        assert!(parse(&["--p2p-port", "4801"]).unwrap().relay.is_empty());
+        let args = parse(&["--p2p-port", "4801", "--relay", relay, "--relay", other]).unwrap();
+        assert_eq!(args.relay, [relay, other]);
+        assert_eq!(p2p_config(&args).unwrap().relays, [relay, other]);
+        assert_eq!(p2p_config(&args).unwrap().features(), "serve,listen,relay");
     }
 
     #[test]

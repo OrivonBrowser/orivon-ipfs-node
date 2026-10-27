@@ -49,7 +49,8 @@ pub struct TooMany;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvidingEntry {
     pub cid: String,
-    /// Unix time in milliseconds of the last announcement that reached the DHT.
+    /// Unix time in milliseconds of the last announcement that reached the DHT, whether the
+    /// records it published carry a direct address or a circuit address.
     pub announced: Option<u64>,
 }
 
@@ -69,6 +70,9 @@ pub fn provider_key(cid: &Cid) -> Vec<u8> {
 pub struct Provided {
     entries: HashMap<Vec<u8>, Entry>,
     reachability: Reachability,
+    /// A relay holds a reservation for the node, so peers can reach it through the relay whatever
+    /// AutoNAT says about a direct connection.
+    relayed: bool,
     reannounce_every: Duration,
     max: usize,
 }
@@ -82,6 +86,7 @@ impl Provided {
         Self {
             entries: HashMap::new(),
             reachability: Reachability::Unknown,
+            relayed: false,
             reannounce_every,
             max,
         }
@@ -111,20 +116,35 @@ impl Provided {
         self.entries.remove(&provider_key(cid)).is_some()
     }
 
-    /// Records the node's reachability. Becoming public makes every CID due at once, since the
-    /// records it published earlier (or none) say nothing about the address that now works.
+    /// True when a provider record would point at an address that works: the node is public, or a
+    /// relay holds a reservation for it.
+    fn announceable(&self) -> bool {
+        self.reachability == Reachability::Public || self.relayed
+    }
+
+    /// Records the node's reachability. Becoming announceable makes every CID due at once, since
+    /// the records it published earlier (or none) say nothing about the address that now works.
     pub fn set_reachability(&mut self, reachability: Reachability, now: Instant) {
-        let turned_public =
-            reachability == Reachability::Public && self.reachability != Reachability::Public;
+        let was = self.announceable();
         self.reachability = reachability;
-        if turned_public {
+        if !was && self.announceable() {
             self.make_all_due(now);
         }
     }
 
-    /// A new confirmed address while public: the records name the old ones, so announce again.
+    /// Records whether a relay holds a reservation for the node. It makes the node announceable
+    /// like a public one, since the circuit address is one a peer can dial.
+    pub fn set_relayed(&mut self, relayed: bool, now: Instant) {
+        let was = self.announceable();
+        self.relayed = relayed;
+        if !was && self.announceable() {
+            self.make_all_due(now);
+        }
+    }
+
+    /// A new confirmed address while announceable: the records name the old ones, so announce again.
     pub fn address_added(&mut self, now: Instant) {
-        if self.reachability == Reachability::Public {
+        if self.announceable() {
             self.make_all_due(now);
         }
     }
@@ -135,10 +155,11 @@ impl Provided {
         }
     }
 
-    /// The CIDs to announce now, at most `room` of them, none unless the node is public. Each is
-    /// marked as running until [`Provided::announced`] or [`Provided::failed`] says how it went.
+    /// The CIDs to announce now, at most `room` of them, none unless the node is public or a relay
+    /// holds a reservation for it. Each is marked as running until [`Provided::announced`] or
+    /// [`Provided::failed`] says how it went.
     pub fn take_due(&mut self, now: Instant, room: usize) -> Vec<Cid> {
-        if self.reachability != Reachability::Public || room == 0 {
+        if !self.announceable() || room == 0 {
             return Vec::new();
         }
         let mut due: Vec<&mut Entry> = self
@@ -301,6 +322,49 @@ mod tests {
         private.add(cid(b"b"), now).unwrap();
         private.address_added(now);
         assert!(private.take_due(now, 4).is_empty());
+    }
+
+    #[test]
+    fn a_relay_reservation_makes_a_private_node_announce() {
+        let (mut provided, now) = state();
+        let a = cid(b"a");
+        provided.add(a, now).unwrap();
+        provided.set_reachability(Reachability::Private, now);
+        assert!(provided.take_due(now, 4).is_empty(), "private, no relay");
+        provided.set_relayed(true, now);
+        assert_eq!(provided.take_due(now, 4), vec![a]);
+        provided.announced(&a, now, 7);
+        assert_eq!(provided.snapshot()[0].announced, Some(7));
+    }
+
+    #[test]
+    fn losing_the_relay_stops_announcing_unless_the_node_is_public() {
+        let (mut provided, now) = state();
+        provided.add(cid(b"a"), now).unwrap();
+        provided.set_relayed(true, now);
+        provided.set_relayed(false, now);
+        assert!(provided.take_due(now, 4).is_empty());
+        provided.set_reachability(Reachability::Public, now);
+        provided.set_relayed(true, now);
+        provided.set_relayed(false, now);
+        assert_eq!(provided.take_due(now, 4).len(), 1, "still public");
+    }
+
+    #[test]
+    fn a_relay_reservation_while_public_announces_again_only_with_its_address() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let a = cid(b"a");
+        provided.add(a, now).unwrap();
+        provided.take_due(now, 4);
+        provided.announced(&a, now, 1);
+        provided.set_relayed(true, now + Duration::from_secs(5));
+        assert!(
+            provided.take_due(now + Duration::from_secs(5), 4).is_empty(),
+            "the reservation alone changes nothing the records say"
+        );
+        provided.address_added(now + Duration::from_secs(5));
+        assert_eq!(provided.take_due(now + Duration::from_secs(5), 4), vec![a]);
     }
 
     #[test]
