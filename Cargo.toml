@@ -1,0 +1,102 @@
+[workspace]
+members = [
+    "crates/orivon-ipfs-core",
+    "crates/orivon-ipfs-dns",
+    "crates/orivon-ipfs-store",
+    "crates/orivon-ipfs-unixfs",
+    "crates/orivon-ipfs-namesys",
+    "crates/orivon-ipfs-routing",
+    "crates/orivon-ipfs-retrieval",
+    "crates/orivon-ipfs-serve",
+    "crates/orivon-ipfs-gateway",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.4.4"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+cid = { version = "0.11", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+data-encoding = "2"
+futures = "0.3"
+http = "1"
+libp2p = { version = "0.56", default-features = false, features = ["autonat", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "quic", "rsa", "tcp", "tls", "tokio", "websocket", "yamux"] }
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand", "rsa"] }
+libp2p-stream = "0.4.0-alpha"
+mime_guess = "2"
+multibase = "0.9"
+multihash = "0.19"
+multihash-codetable = { version = "0.2", features = ["sha2"] }
+parking_lot = "0.12"
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_ipld_dagcbor = "0.6"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs", "sync"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "json"] }
+unsigned-varint = "0.8"
+url = "2"
+
+orivon-ipfs-core = { path = "crates/orivon-ipfs-core" }
+orivon-ipfs-dns = { path = "crates/orivon-ipfs-dns" }
+orivon-ipfs-store = { path = "crates/orivon-ipfs-store" }
+orivon-ipfs-unixfs = { path = "crates/orivon-ipfs-unixfs" }
+orivon-ipfs-namesys = { path = "crates/orivon-ipfs-namesys" }
+orivon-ipfs-routing = { path = "crates/orivon-ipfs-routing" }
+orivon-ipfs-retrieval = { path = "crates/orivon-ipfs-retrieval" }
+orivon-ipfs-serve = { path = "crates/orivon-ipfs-serve" }
+
+# wasm32-wasip2 build (orivon-ipfs-gateway). The vendored `if-watch` and
+# `libp2p-dns` are the crates.io releases this lockfile resolves, each with one
+# added wasi arm. `if-watch`'s generic fallback backend has no WASI support at
+# all (needs async-io + if-addrs, neither builds there); its wasi arm never
+# observes an interface, which libp2p-tcp already tolerates. `libp2p-dns`
+# compiles everywhere except its `Transport::system()` constructor (unused
+# here), which unconditionally calls a unix/windows-only resolv.conf reader;
+# it is gated out on wasi. Native builds are unaffected either way.
+[patch.crates-io]
+if-watch = { path = "vendor/if-watch" }
+libp2p-dns = { path = "vendor/libp2p-dns" }
+# Single-threaded runtime: `runtime::blocking::pool::spawn_task` on
+# wasi runs the blocking closure inline on the calling thread instead of
+# handing it to a worker-thread pool that can't exist under wasm32-wasip2
+# (no thread-spawn host import there). One patch point covers spawn_blocking,
+# tokio::fs and lookup_host at once, since all of them funnel through it.
+tokio = { path = "vendor/tokio" }
+# futures-timer's global timer spawns a background OS thread lazily on
+# first use; that spawn fails on wasm32-wasip2 and every Delay it hands out
+# afterward silently becomes permanently inert (panics the first time
+# anything polls or resets one). libp2p-core uses it for essentially every
+# protocol timeout (identify/ping intervals, connection idle-timeout, redial
+# backoff). The wasi Delay here is built on tokio::time::sleep instead,
+# which needs no background thread.
+futures-timer = { path = "vendor/futures-timer" }
+# libp2p-identity 0.2.13 gates every RSA decoding/verification path on
+# `all(feature = "rsa", not(target_arch = "wasm32"))`, and its own Cargo.toml
+# gates the `ring` dependency itself the same way -- so a legacy `Qm...`-format
+# (RSA) libp2p PeerID cannot complete a noise handshake on ANY wasm32 target,
+# including wasm32-wasip2, even though `ring` (the crate actually doing the
+# RSA math here, not the `rsa` crate) has no wasm32-wasip2 problem at all: it
+# builds and links clean with wasi-sdk out of the box (nothing in `ring`
+# needed patching). The gate is purely `target_arch = "wasm32"`, which is also
+# true of the browser's wasm32-unknown-unknown -- this vendored copy narrows
+# every one of those gates (Cargo.toml's `ring` dependency, and every
+# `#[cfg(...)]` in src/{lib,keypair,error}.rs; all of them are this one gate)
+# to `target_os = "unknown"`, so wasm32-wasip2 (real sockets, no browser) keeps
+# RSA and wasm32-unknown-unknown still doesn't.
+libp2p-identity = { path = "vendor/libp2p-identity" }

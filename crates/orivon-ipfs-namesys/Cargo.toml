@@ -1,0 +1,52 @@
+[package]
+name = "orivon-ipfs-namesys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+cid.workspace = true
+futures.workspace = true
+ipld-core = "0.4"
+libp2p-identity.workspace = true
+multihash.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_ipld_dagcbor.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+# A hand-rolled HTTP/1.1 client (src/wasi_http.rs) built from the same
+# hyper/rustls/webpki-roots crates reqwest's own rustls-tls feature already
+# resolves into this workspace's Cargo.lock on native targets -- no new crate
+# versions. It is the only HTTP client on wasi and is built on every target so
+# its tests run natively.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+# Nothing else enables rustls's "ring" feature on wasi (reqwest's own rustls
+# dependency, which does, is target-gated out here); libp2p-identity's own
+# `ring` dependency is unrelated -- it uses ring directly for RSA,
+# not through rustls's crypto-provider feature.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+webpki-roots = "1"
+tokio.workspace = true
+bytes.workspace = true
+
+# reqwest's wasm backend is selected by `cfg(target_arch = "wasm32")` alone (no
+# `target_os` check), so it would otherwise silently pick the browser
+# fetch()/web-sys client on wasm32-wasip2 too -- neither Send nor able to call
+# a real window.fetch under wasmtime. wasm32-wasip2 has real WASI sockets
+# instead; see src/wasi_http.rs for what that build does instead of it.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+reqwest.workspace = true
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

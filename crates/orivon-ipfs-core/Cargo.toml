@@ -1,0 +1,16 @@
+[package]
+name = "orivon-ipfs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cid.workspace = true
+multihash.workspace = true
+multihash-codetable.workspace = true
+thiserror.workspace = true
+unsigned-varint.workspace = true
+
+[dev-dependencies]
+data-encoding.workspace = true

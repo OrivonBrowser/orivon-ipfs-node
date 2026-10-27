@@ -1,0 +1,62 @@
+name: Orivon WebAssembly build
+
+# Builds the node for Orivon as orivon/build.sh does (wasm32-wasip2, transpiled by jco) and uploads dist/ with the
+# sha256 of each file. The folder published for Orivon apps is dist/ without ipfs-node.wasm.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUSTUP_HOME: /home/runner/.rustup
+      CARGO_HOME: /home/runner/.cargo
+      CARGO_JOBS: 4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Rust with the wasm32-wasip2 standard library
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-wasip2
+          rustc +stable --version
+
+      - name: wasi-sdk 34
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: jco-transpile 0.15.0
+        run: |
+          npm install --prefix "$RUNNER_TEMP/jco" --no-audit --no-fund @bytecodealliance/jco-transpile@0.15.0
+          echo "ORIVON_JCO_DIR=$RUNNER_TEMP/jco" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: bash orivon/build.sh
+
+      - name: Checksums
+        run: |
+          rustc +stable --version > build-info.txt
+          (cd dist && find . -type f | sort | xargs sha256sum) | tee -a build-info.txt
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v7
+        with:
+          name: orivon-wasm
+          path: |
+            dist/
+            build-info.txt
+          if-no-files-found: error
+          retention-days: 14

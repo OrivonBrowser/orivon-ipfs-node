@@ -1,0 +1,34 @@
+[package]
+name = "orivon-ipfs-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+cid.workspace = true
+clap.workspace = true
+orivon-ipfs-core.workspace = true
+orivon-ipfs-namesys.workspace = true
+orivon-ipfs-retrieval.workspace = true
+orivon-ipfs-serve.workspace = true
+orivon-ipfs-routing.workspace = true
+orivon-ipfs-store.workspace = true
+orivon-ipfs-unixfs.workspace = true
+futures.workspace = true
+http.workspace = true
+mime_guess.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tempfile.workspace = true

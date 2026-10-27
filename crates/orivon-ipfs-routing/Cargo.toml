@@ -1,0 +1,46 @@
+[package]
+name = "orivon-ipfs-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cid.workspace = true
+async-trait.workspace = true
+orivon-ipfs-namesys.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+# See orivon-ipfs-namesys/Cargo.toml: reqwest's wasm backend is
+# target_arch-gated, not target_os-gated, so it would wrongly pick the
+# browser fetch() client under wasm32-wasip2 too.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+reqwest.workspace = true
+
+# The top-level `libp2p` facade doesn't re-export its `tcp`/`dns` module
+# names for ANY wasm32 target (`#[cfg(not(target_arch = "wasm32"))]` in its
+# own lib.rs), even though libp2p-tcp/libp2p-dns's own `tokio` backends are
+# only `feature = "tokio"` gated, not wasm32-gated -- they work fine, the
+# facade just doesn't offer the name there. build_dht_swarm's wasi arm
+# depends on them directly instead (aliased to the same tcp/dns names the
+# non-wasi build gets from the facade), same versions libp2p.workspace's
+# own "tcp"/"dns" features already resolve.
+[target.'cfg(target_os = "wasi")'.dependencies]
+libp2p-tcp = { version = "0.44.1", features = ["tokio"] }
+libp2p-dns = { version = "0.44.0", features = ["tokio"] }
+# The DNS transport below resolves over TCP only, because a host grants no UDP (see orivon-ipfs-dns).
+orivon-ipfs-dns.workspace = true
+
+[dev-dependencies]
+ipld-core = "0.4"
+libp2p-identity.workspace = true
+multihash.workspace = true
+prost.workspace = true
+serde_ipld_dagcbor.workspace = true

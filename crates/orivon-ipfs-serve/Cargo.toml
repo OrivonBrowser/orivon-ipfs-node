@@ -1,0 +1,34 @@
+[package]
+name = "orivon-ipfs-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+cid.workspace = true
+orivon-ipfs-core.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+libp2p-stream.workspace = true
+multihash.workspace = true
+multihash-codetable.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_ipld_dagcbor.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unsigned-varint.workspace = true
+
+# The libp2p facade re-exports neither tcp nor dns on wasm32 (see
+# orivon-ipfs-retrieval/Cargo.toml), so WASI depends on them directly.
+[target.'cfg(target_os = "wasi")'.dependencies]
+libp2p-tcp = { version = "0.44.1", features = ["tokio"] }
+libp2p-dns = { version = "0.44.0", features = ["tokio"] }
+# The DNS transport below resolves over TCP only, because a host grants no UDP (see orivon-ipfs-dns).
+orivon-ipfs-dns.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

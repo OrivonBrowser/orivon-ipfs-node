@@ -1,0 +1,11 @@
+[package]
+name = "orivon-ipfs-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Same package libp2p-dns resolves, so `ResolverConfig` here is the type
+# `libp2p_dns::tokio::Transport::custom` takes.
+[dependencies]
+hickory-resolver = { version = "0.25.2", default-features = false }

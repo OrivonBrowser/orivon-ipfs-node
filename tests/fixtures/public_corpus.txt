@@ -1,0 +1,22 @@
+# Public paths used by the opt-in live corpus smoke.
+# Format: name path min_bytes optional_range_bytes
+vitalik-home /ipfs/bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u 1024 128
+# daicowtf-home often has no reachable providers, for this node and for Kubo alike, so it stays out
+# of the default live corpus.
+# daicowtf-home /ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne 1024 128
+
+# DNSLink-backed /ipns media paths. These are intentionally mutable and
+# exercise the node's DNSLink resolver, /ipns gateway path, delegated routing,
+# Bitswap, and byte-range retrieval through the local gateway. Exclude mutable
+# site roots if they become flaky because public providers disappear.
+ipfs-tech-developers-hero /ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg 10000 128
+ipfs-tech-ribbon-community-7 /ipns/ipfs.tech/_nuxt/ribbon-community-7.BM6mrSZz.jpg 10000 128
+ipfs-tech-ribbon-community-8 /ipns/ipfs.tech/_nuxt/ribbon-community-8.kKCRQ1KB.jpg 10000 128
+ipfs-tech-ribbon-home-1 /ipns/ipfs.tech/_nuxt/ribbon-home-1.Db3iUyss.jpg 10000 128
+ipfs-tech-ribbon-home-2 /ipns/ipfs.tech/_nuxt/ribbon-home-2.xhPE7YJm.jpg 10000 128
+ipfs-tech-ribbon-home-3 /ipns/ipfs.tech/_nuxt/ribbon-home-3.CsPAOEU8.jpg 10000 128
+
+# Additional DNSLink site outside ipfs.tech. The root is intentionally small
+# but currently stable and exercises DNSLink TXT resolution through the local
+# gateway without relying on public HTTP gateways.
+wikipedia-on-ipfs-en-root /ipns/en.wikipedia-on-ipfs.org 128 64

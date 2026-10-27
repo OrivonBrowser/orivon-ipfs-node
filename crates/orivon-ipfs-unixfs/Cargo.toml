@@ -1,0 +1,16 @@
+[package]
+name = "orivon-ipfs-unixfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cid.workspace = true
+orivon-ipfs-core.workspace = true
+multihash.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+orivon-ipfs-store.workspace = true

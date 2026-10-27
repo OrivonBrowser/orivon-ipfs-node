@@ -1,0 +1,41 @@
+[package]
+name = "orivon-ipfs-retrieval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cid.workspace = true
+orivon-ipfs-core.workspace = true
+orivon-ipfs-namesys.workspace = true
+orivon-ipfs-routing.workspace = true
+orivon-ipfs-store.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+libp2p-stream.workspace = true
+multihash.workspace = true
+multihash-codetable.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unsigned-varint.workspace = true
+url.workspace = true
+
+# See orivon-ipfs-namesys/Cargo.toml (reqwest's wasm backend is
+# target_arch-gated) and orivon-ipfs-routing/Cargo.toml (the libp2p facade
+# doesn't re-export tcp/dns for any wasm32 target).
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+reqwest.workspace = true
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+libp2p-tcp = { version = "0.44.1", features = ["tokio"] }
+libp2p-dns = { version = "0.44.0", features = ["tokio"] }
+# The DNS transport below resolves over TCP only, because a host grants no UDP (see orivon-ipfs-dns).
+orivon-ipfs-dns.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
