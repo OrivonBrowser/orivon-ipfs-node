@@ -15,7 +15,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{autonat, identify, Multiaddr, PeerId};
 use std::time::Duration;
-use support::{eventually, free_port, loopback, tcp_swarm, with_peer};
+use support::{eventually, free_port, loopback, start_relay, tcp_swarm, with_peer};
 use tokio::sync::{mpsc, oneshot};
 
 const LIMIT: Duration = Duration::from_secs(40);
@@ -301,4 +301,62 @@ async fn too_many_cids_are_refused() {
     assert_eq!(node.provide(one_more).await, Err(ProvideError::TooMany));
     let first = cid_from_data(CODEC_RAW, &0u32.to_be_bytes());
     assert_eq!(node.provide(first).await, Ok(AddOutcome::AlreadyProvided));
+}
+
+#[tokio::test]
+async fn a_node_behind_a_relay_announces_the_circuit_address_whatever_autonat_says() {
+    let server = Server::start(false).await;
+    let relay = start_relay().await;
+    let (kept, cid) = kept_block(b"announce through a relay");
+    // No AutoNAT server answers, so the node never turns public: the reservation is all it has.
+    let config = P2pConfig::new(free_port())
+        .with_dht(vec![server.bootstrap()])
+        .with_relays(vec![relay.bootstrap()]);
+    let node = ServeNode::start_with_p2p(kept, true, Some(config))
+        .await
+        .unwrap();
+    assert_eq!(node.features(), Some("serve,listen,provide,relay"));
+    node.provide(cid).await.unwrap();
+
+    let status = status_where(&node, "an announcement through the relay", |s| {
+        s.providing
+            .first()
+            .is_some_and(|entry| entry.announced.is_some())
+    })
+    .await;
+    assert_ne!(status.reachability, Reachability::Public);
+    assert!(status.external.is_empty(), "{:?}", status.external);
+    assert_eq!(status.relays.len(), 1);
+    let circuit = status.relays[0].to_string();
+    let records = server.providers(cid.hash().to_bytes()).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].provider, node.peer_id());
+    assert!(
+        records[0]
+            .addresses
+            .iter()
+            .any(|addr| addr.to_string().starts_with(&circuit)),
+        "{circuit} not in {:?}",
+        records[0].addresses
+    );
+}
+
+#[tokio::test]
+async fn a_node_that_cannot_reach_its_relay_announces_nothing() {
+    let server = Server::start(false).await;
+    let (kept, cid) = kept_block(b"no relay, no announcement");
+    let nobody = format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", free_port(), PeerId::random());
+    let config = P2pConfig::new(free_port())
+        .with_dht(vec![server.bootstrap()])
+        .with_relays(vec![nobody]);
+    let node = ServeNode::start_with_p2p(kept, true, Some(config))
+        .await
+        .unwrap();
+    node.provide(cid).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let status = node.status().await.unwrap();
+    assert!(status.relays.is_empty());
+    assert_eq!(status.providing[0].announced, None);
+    assert_eq!(server.announcements().await, 0);
 }

@@ -227,6 +227,7 @@ async fn status(State(state): State<ServeApiState>) -> Response {
             "peer": status.peer.to_string(),
             "listen": status.listen.iter().map(|addr| addr.to_string()).collect::<Vec<_>>(),
             "external": status.external.iter().map(|addr| addr.to_string()).collect::<Vec<_>>(),
+            "relays": status.relays.iter().map(|addr| addr.to_string()).collect::<Vec<_>>(),
             "reachability": status.reachability.as_str(),
             "providing": status.providing.iter().map(|entry| serde_json::json!({
                 "cid": entry.cid,
@@ -603,6 +604,7 @@ mod tests {
         assert!(status["peer"].as_str().unwrap().starts_with("12D3"));
         assert!(status["listen"].as_array().is_some());
         assert!(status["external"].as_array().is_some());
+        assert_eq!(status["relays"], serde_json::json!([]));
         assert_eq!(status["reachability"], "public");
         assert_eq!(status["providing"][0]["cid"], cid);
         assert!(status["providing"][0]["announced"].is_null());

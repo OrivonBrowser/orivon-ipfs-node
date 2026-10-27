@@ -120,7 +120,8 @@ Without the flag nothing in this section applies and the node behaves exactly as
 kept blocks exactly as it answers a peer the node dialed. IPv4 must listen, or the node exits with the
 reason (the port is taken, say); IPv6 is tried too and may fail, as it does inside Orivon, whose
 network listen binds IPv4 only. TCP is the only transport: a peer that can reach this node only
-over QUIC, WebSocket, WebRTC or a relay cannot.
+over QUIC, WebSocket or WebRTC cannot. A peer that reaches it through a circuit relay can (see
+`--relay` below).
 
 With `--online` and `--routing-mode auto` or `light-dht` the swarm also runs:
 
@@ -147,28 +148,60 @@ answers agree and every 5 minutes after, and a newly learned address makes it as
 computer that cannot be reached keeps asking about once a minute. It asks peers
 the DHT connected it to that serve AutoNAT, kept in a list of up to 16.
 
+**Holding a place on a relay (`--relay <address>/p2p/<relay id>`, repeatable, needs `--p2p-port`).**
+A computer behind a router that refuses incoming connections can ask a circuit relay v2 to hold a
+reservation for it; a peer then connects to the relay, and the relay passes the connection on. The
+address has the form `/ip4|ip6|dns4|dns6/<host>/tcp/<port>/p2p/<relay id>` and must be public (the
+same rule as `POST /dial`; `--allow-local-dial` lifts it). Up to 8 relays, one reservation each; a
+second address for a relay already named is ignored. A malformed address stops the node from starting.
+
+- The swarm dials each relay, asks for a reservation, and renews it before it runs out. Once the relay
+  accepts, `<relay address>/p2p/<relay id>/p2p-circuit/p2p/<this node>` is one of the node's
+  external addresses and what a provider record carries next to the confirmed direct ones.
+- When the connection to a relay drops, or the relay refuses, the node asks again after 2 seconds,
+  doubling up to 2 minutes while it keeps failing. A reservation that lasted 30 seconds starts the
+  count again. A relay that cannot be reached leaves everything else working.
+- A node that holds a reservation announces its provided CIDs whatever AutoNAT says, at the moment the
+  reservation is accepted, whenever one is accepted again after a loss, and on the usual schedule. Without
+  a reservation the rule is the one above: only `public` announces. `reachability` is still the AutoNAT
+  answer, and the circuit addresses are listed in `relays`, not in `external` or `listen`.
+- A connection through a relay is an ordinary connection to the node: Bitswap, identify and ping run
+  over it as they do over TCP, and the same bounds apply. The node asks the relay for no particular
+  limit and treats a connection the relay marks as limited like any other; Orivon's relay sends no
+  limit. A relay that does enforce a duration or byte limit ends the connection when it is reached.
+  `POST /dial` takes direct addresses only.
+- The same relay support is on the fetching side: a provider whose only address is
+  `<relay address>/p2p/<relay id>/p2p-circuit/p2p/<peer id>` is dialed through the relay, ranked after
+  every direct address.
+
 **Requests** (the same `x-orivon-key` rule as above; the paths do not exist on a node without a
 listener, and `/provide` not on one without a DHT):
 
 - `GET /health` adds `x-orivon-node-features: serve,listen,provide` (`serve,listen` on a node
-  without a DHT). A node without `--p2p-port` sends no such header.
+  without a DHT), with `,relay` added at the end when `--relay` was accepted. A node without
+  `--p2p-port` sends no such header.
 - `POST /provide`, body `{"cid":"<cid>"}`: 404 unless a block of that CID (same multihash) is kept;
   else `202 {"cid":"<cid>"}`. The node announces it, when it is reachable, as a provider record keyed by
   the CID's multihash, as Kubo does (so a CIDv0 and a CIDv1 of one block are one entry), carrying the
-  confirmed external addresses. It announces when the node first turns `public`, whenever it turns
-  `public` again, when a new external address is confirmed, and every 12 hours after an announcement
-  reached a peer. An announcement that reached no peer is tried again after a minute. It never
-  announces while the node is not `public`. Four announcements run at once. Providing the same CID
+  confirmed external addresses. It announces when the node first turns `public` or a relay accepts a
+  reservation, whenever it turns `public` again or a relay accepts one again, when a new external
+  address is confirmed, and every 12 hours after an announcement reached a peer. An announcement that
+  reached no peer is tried again after a minute. It never announces while the node is not `public`
+  and holds no relay reservation. Four announcements run at once. Providing the same CID
   twice is one entry; a 1025th CID answers 429. Only the CIDs named are announced, so name the root
   of a share: the peer that finds it fetches the rest of the DAG from the node over the connection.
 - `DELETE /provide/<cid>`: stops announcing and forgets it (`200 {"cid":"<cid>"}`), 404 when it was
   not being provided. Records already published expire on their own (about 48 hours).
 - `GET /status`: `{"peer":"<peer id>","listen":[<multiaddr>,...],"external":[<multiaddr>,...],
-  "reachability":"public"|"private"|"unknown","providing":[{"cid":"<cid>","announced":<unix ms>|null}]}`.
+  "relays":[<multiaddr>,...],"reachability":"public"|"private"|"unknown",
+  "providing":[{"cid":"<cid>","announced":<unix ms>|null}]}`.
   `listen` is what the swarm reports (one address per network interface; the wildcard addresses when
   the build cannot list interfaces, as the WebAssembly build cannot). Addresses carry no `/p2p/` suffix.
-  `external` is the confirmed addresses. `reachability` is `unknown` until a probe has an answer or
-  while no address is confirmed. `announced` is the time of the last announcement that reached a peer.
+  `external` is the confirmed addresses. `relays` is the circuit addresses a relay holds a reservation
+  for, `<relay address>/p2p/<relay id>/p2p-circuit/p2p/<this node>` (the only addresses here that
+  end in a `/p2p/` part), and `[]` without `--relay`. `reachability` is `unknown` until a probe has an
+  answer or while no address is confirmed, and says nothing of relays. `announced` is the time of the
+  last announcement that reached a peer, directly or through a relay reservation.
 
 **Bounds**, on top of every bound above: at most 64 established inbound connections, 4 per peer
 (either direction), 32 inbound connections still being set up, 32 established connections the node
@@ -178,9 +211,10 @@ the node also dials public IP addresses only (names are resolved first), whoever
 a DHT peer cannot send it to the local network; `--allow-local-dial` lifts that too.
 
 **Known limits.** A computer behind a router that refuses incoming connections stays unreachable:
-AutoNAT says `private`, nothing is announced, and the node does not open the port itself (no UPnP,
-NAT-PMP, relay or hole punching). It becomes `public` by itself when the port is forwarded or the
-router starts accepting. After reachability is lost the status can stay `public` for up to about 20
+AutoNAT says `private`, nothing is announced unless `--relay` gives it a reservation, and the node
+does not open the port itself (no UPnP, NAT-PMP or hole punching). It becomes `public` by itself when
+the port is forwarded or the router starts accepting. Through a relay every byte of a fetch passes the
+relay, so its bandwidth bounds the transfer. After reachability is lost the status can stay `public` for up to about 20
 minutes, until enough probes fail. The announcement carries the node's addresses as of that moment;
 an address that changes later is announced again once AutoNAT confirms the new one. The DHT
 client is not a server, so the network learns the node only through the provider records.
@@ -231,8 +265,9 @@ dropped as soon as one answers with providers. An empty answer from the service 
 ## Known limits
 
 - Providers that offer Bitswap over plain TCP, or a gateway-style HTTP(S) endpoint
-  (`transport-ipfs-gateway-http`), can serve blocks. Providers reachable only over WSS, QUIC, WebRTC or a
-  relay cannot. A block whose providers are all of those answers 502 or 504.
+  (`transport-ipfs-gateway-http`), or through a circuit relay (`/p2p-circuit` with the relay's address and
+  id), can serve blocks. Providers reachable only over WSS, QUIC or WebRTC cannot. A block whose
+  providers are all of those answers 502 or 504.
 - Provider lookups through the light DHT alone are slow and often find nothing; it is a fallback.
 - The HTTP client resolves names with the host's resolver (`ip-name-lookup`). On a network that
   answers the default delegated service's name with another address, that lookup fails with a
