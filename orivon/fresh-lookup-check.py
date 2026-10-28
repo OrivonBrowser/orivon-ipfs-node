@@ -406,10 +406,6 @@ class Rig:
             say(line)
         with open(os.path.join(self.out, "results.json"), "w") as f:
             json.dump({"platform": platform.platform(), "results": RESULTS, "summary": lines}, f, indent=1)
-        step = os.environ.get("GITHUB_STEP_SUMMARY")
-        if step:
-            with open(step, "a") as f:
-                f.write(f"### {platform.system()}\n```\n" + "\n".join(lines) + "\n```\n")
 
     def cleanup(self):
         if getattr(self, "kubo", None):
