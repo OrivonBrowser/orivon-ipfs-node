@@ -44,12 +44,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { fetcher: kubo, via: relay, broadcast: off }
-          - { fetcher: kubo, via: relay, broadcast: on }
-          - { fetcher: kubo, via: direct, broadcast: off }
-          - { fetcher: node, via: relay, broadcast: off }
-          - { fetcher: node, via: direct, broadcast: off }
-    name: ${{ matrix.fetcher }} ${{ matrix.via }} broadcast ${{ matrix.broadcast }}
+          - { fetcher: kubo, via: relay, routing: dht, broadcast: on }
+          - { fetcher: kubo, via: relay, routing: dht, broadcast: off }
+          - { fetcher: kubo, via: relay, routing: none, broadcast: off }
+          - { fetcher: kubo, via: direct, routing: none, broadcast: off }
+          - { fetcher: node, via: relay, routing: none, broadcast: off }
+          - { fetcher: node, via: direct, routing: none, broadcast: off }
+    name: ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -76,6 +77,7 @@ jobs:
           FETCHER: ${{ matrix.fetcher }}
           VIA: ${{ matrix.via }}
           BROADCAST: ${{ matrix.broadcast }}
+          ROUTING: ${{ matrix.routing }}
           LOG_DIR: ${{ runner.temp }}/logs
         run: |
           chmod +x bin/orivon-ipfs-gateway
@@ -87,7 +89,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### ${{ matrix.fetcher }} ${{ matrix.via }} broadcast ${{ matrix.broadcast }}"
+            echo "### ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }}"
             echo '```'
             grep -a '^LADDER' "$RUNNER_TEMP/ladder.txt" || true
             echo '```'
@@ -97,6 +99,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-${{ matrix.fetcher }}-${{ matrix.via }}-${{ matrix.broadcast }}
+          name: logs-${{ matrix.fetcher }}-${{ matrix.via }}-${{ matrix.routing }}-${{ matrix.broadcast }}
           path: ${{ runner.temp }}/logs
           if-no-files-found: ignore

@@ -11,9 +11,11 @@
 # One file is then asked for at once, and one more after each wait in $IDLES (default 0 20 60 120
 # seconds), each file once.
 #
-#   FETCHER=kubo  a scratch Kubo that is connected to the node by address, disconnected for the
-#                 wait, connected again and asked for `ipfs cat <root>/<file>`. BROADCAST=on|off
-#                 turns Kubo's bitswap broadcast control on or off (default off).
+#   FETCHER=kubo  a scratch Kubo asked for `ipfs cat <root>/<file>` each time after being
+#                 disconnected from the node for the wait. ROUTING=none (default): Kubo has no content
+#                 routing and is connected to the node by address; ROUTING=dht: Kubo finds the node
+#                 through the public DHT, as a visitor would. BROADCAST=on|off turns Kubo's bitswap
+#                 broadcast control on or off (default off).
 #   FETCHER=node  a second copy of the node asked for each raw block over HTTP, the way Orivon's
 #                 browser reads a path. A small routing service stands in for the DHT: it names the
 #                 node as a provider of exactly the CIDs the node reports in GET /status as provided.
@@ -28,6 +30,8 @@ RELAY=${RELAY:-}
 IDLES=${IDLES:-"0 20 60 120"}
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-40}
 BROADCAST=${BROADCAST:-off}
+ROUTING=${ROUTING:-none}
+ANNOUNCE_WAIT=${ANNOUNCE_WAIT:-240}
 FILES=${FILES:-8}
 SCRATCH=${SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/later-connection.XXXXXX")}
 KEY=${KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}
@@ -86,6 +90,7 @@ PEER=$(curl -s "${H[@]}" "$API/id" | json_get peer)
 say "node $PEER"
 curl -s -X POST "${H[@]}" --data-binary @"$SCRATCH/site.car" "$API/blocks" >/dev/null
 say "provide root -> $(curl -s -o /dev/null -w '%{http_code}' -X POST "${H[@]}" -d "{\"cid\":\"$ROOT\"}" "$API/provide")"
+announced_all() { curl -s "${H[@]}" "$API/status" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["providing"] and all(e["announced"] for e in d["providing"]) else 1)'; }
 if [ "$VIA" = relay ]; then
   ADDR=""
   for _ in $(seq 1 120); do
@@ -97,15 +102,27 @@ else
   ADDR="/ip4/127.0.0.1/tcp/$P2P_PORT/p2p/$PEER"
 fi
 say "the node is reached at $ADDR"
+if [ "$ROUTING" = dht ] && [ "$FETCHER" = kubo ]; then
+  end=$((SECONDS + ANNOUNCE_WAIT))
+  until announced_all; do
+    [ $SECONDS -ge $end ] && { say "not every provided CID was announced in ${ANNOUNCE_WAIT}s"; break; }
+    sleep 3
+  done
+  say "provided: $(curl -s "${H[@]}" "$API/status" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["providing"]), "CIDs,", sum(1 for e in d["providing"] if e["announced"]), "announced")')"
+fi
 
 #### FETCHER=kubo
 
 kubo_ladder() {
   export IPFS_PATH="$SCRATCH/f"
   "$IPFS" init --profile=test >/dev/null 2>&1 || { say "ipfs init failed"; exit 2; }
-  "$IPFS" bootstrap rm --all >/dev/null 2>&1
-  "$IPFS" config --json Routing.Type '"none"' >/dev/null 2>&1
-  "$IPFS" config --json AutoConf.Enabled false >/dev/null 2>&1
+  if [ "$ROUTING" = dht ]; then
+    "$IPFS" config --json Routing.Type '"dhtclient"' >/dev/null 2>&1
+  else
+    "$IPFS" bootstrap rm --all >/dev/null 2>&1
+    "$IPFS" config --json Routing.Type '"none"' >/dev/null 2>&1
+    "$IPFS" config --json AutoConf.Enabled false >/dev/null 2>&1
+  fi
   "$IPFS" config --json Discovery.MDNS.Enabled false >/dev/null 2>&1
   "$IPFS" config --json Swarm.DisableNatPortMap true >/dev/null 2>&1
   "$IPFS" config --json Swarm.RelayClient.Enabled true >/dev/null 2>&1
@@ -127,7 +144,16 @@ kubo_ladder() {
     sleep 0.5
   done
 
+  if [ "$ROUTING" = dht ]; then
+    for _ in $(seq 1 60); do
+      [ "$("$IPFS" swarm peers 2>/dev/null | wc -l)" -ge 8 ] && break
+      sleep 1
+    done
+    say "kubo has $("$IPFS" swarm peers 2>/dev/null | wc -l) peers"
+  fi
+  FETCHER_ID=$("$IPFS" id -f '<id>')
   connect() {
+    [ "$ROUTING" = dht ] && return 0
     local started; started=$(now)
     if timeout 60 "$IPFS" swarm connect "$ADDR" >"$SCRATCH/connect.out" 2>&1; then
       say "connect ok in $(python3 -c "print(round($(now)-$started,1))") s"
@@ -194,6 +220,10 @@ ThreadingHTTPServer(('127.0.0.1', int(port)), Handler).serve_forever()
 PY
   python3 -I "$SCRATCH/router.py" "$API" "$KEY" "$PEER" "$ADDR" "$router_port" >"$SCRATCH/router.log" 2>&1 &
   PIDS+=("$!")
+  for _ in $(seq 1 60); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$router_port/routing/v1/providers/warmup")" = 200 ] && break
+    sleep 0.25
+  done
   "$NODE_BIN" --online --routing-mode delegated --delegated-router "http://127.0.0.1:$router_port/routing/v1" \
     --addr "127.0.0.1:$fetch_port" --trace-filter "${FETCH_TRACE:-orivon_ipfs_retrieval=info,warn}" >"$SCRATCH/fetcher.log" 2>&1 &
   PIDS+=("$!")
@@ -229,10 +259,27 @@ case "$FETCHER" in
   *) say "FETCHER must be kubo or node"; exit 2 ;;
 esac
 
-say "---- node log (connections, streams, wantlists, replies)"
-grep -a -E 'connection (established|closed)|inbound bitswap stream|bitswap (wantlist|reply|stream)|relay|Returning sender|Not connected' "$SCRATCH/node.log" | tail -150
+say "---- what the node saw of the fetcher"
+python3 -I - "$SCRATCH/node.log" "${FETCHER_ID:-}" <<'PY'
+import re, sys
+path, known = sys.argv[1], sys.argv[2]
+ansi = re.compile(r'\x1b\[[0-9;]*m')
+lines = [ansi.sub('', line.rstrip('\n')) for line in open(path, errors='replace')]
+peers = {known} if known else set()
+for line in lines:
+    if 'connection established' in line and ('127.0.0.1' in line or 'p2p-circuit' in line):
+        found = re.search(r'peer_id=(\S+)', line)
+        if found:
+            peers.add(found.group(1))
+shown = [line for line in lines
+         if any(('peer_id=' + peer + ' ') in line + ' ' or ('peer=' + peer + ' ') in line + ' ' for peer in peers)
+         and re.search(r'connection (established|closed)|inbound bitswap stream|bitswap (wantlist|reply|stream)', line)]
+print('fetcher peers:', ', '.join(sorted(peers)) or 'none seen')
+for line in shown[-120:]:
+    print(line[:320])
+PY
 [ -f "$SCRATCH/router.log" ] && { say "---- router log"; tail -40 "$SCRATCH/router.log"; }
-[ -f "$SCRATCH/fetcher.log" ] && { say "---- fetcher log"; grep -a -v '^$' "$SCRATCH/fetcher.log" | tail -120; }
+[ -f "$SCRATCH/fetcher.log" ] && { say "---- fetcher log"; sed 's/\x1b\[[0-9;]*m//g' "$SCRATCH/fetcher.log" | grep -a -E 'bitswap_session|bitswap_peer_expand|provider_lookup|bitswap_successful_peer|dial|connection|circuit|bitswap_request|bitswap_fetch' | cut -c1-330 | tail -80; }
 if [ -n "${LOG_DIR:-}" ]; then
   mkdir -p "$LOG_DIR"
   cp "$SCRATCH"/*.log "$LOG_DIR"/ 2>/dev/null
