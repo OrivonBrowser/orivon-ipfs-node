@@ -72,6 +72,11 @@ orivon-ipfs-serve = { path = "crates/orivon-ipfs-serve" }
 [patch.crates-io]
 if-watch = { path = "vendor/if-watch" }
 libp2p-dns = { path = "vendor/libp2p-dns" }
+# libp2p-kad 0.48.0 hands a lookup's caller the ids of the providers it found and drops the
+# addresses their records carried. A provider that is a DHT client behind a circuit relay has no
+# other address anywhere, so a lookup could never reach it. vendor/libp2p-kad/ORIVON.md has the one
+# change (a few lines in src/behaviour.rs).
+libp2p-kad = { path = "vendor/libp2p-kad" }
 # Single-threaded runtime: `runtime::blocking::pool::spawn_task` on
 # wasi runs the blocking closure inline on the calling thread instead of
 # handing it to a worker-thread pool that can't exist under wasm32-wasip2

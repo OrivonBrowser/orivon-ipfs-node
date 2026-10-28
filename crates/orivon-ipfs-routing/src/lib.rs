@@ -57,6 +57,9 @@ const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const DHT_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 8;
 const DHT_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
+const DHT_PARALLELISM: usize = 3;
+/// After the first server names a provider it can reach, the walk waits this long for more.
+const DHT_PROVIDER_GRACE: Duration = Duration::from_millis(250);
 /// The peers the light DHT starts from, as `<address>/p2p/<peer id>`.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "/dnsaddr/sg1.bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
@@ -944,10 +947,17 @@ impl LightDhtClient {
         let mut ended = "deadline";
         let deadline = tokio::time::sleep(self.query_timeout);
         tokio::pin!(deadline);
+        let grace = tokio::time::sleep(self.query_timeout);
+        tokio::pin!(grace);
+        let mut grace_armed = false;
 
         loop {
             tokio::select! {
                 _ = &mut deadline => {
+                    break;
+                }
+                _ = &mut grace, if grace_armed => {
+                    ended = "grace";
                     break;
                 }
                 event = swarm.select_next_some() => {
@@ -976,6 +986,16 @@ impl LightDhtClient {
                             if provider_ids.len() >= self.max_providers {
                                 ended = "enough";
                                 break;
+                            }
+                            // A provider that can be dialed ends the walk soon: the rest of the
+                            // closest peers hold the same records.
+                            if !grace_armed
+                                && reachable_provider_count(&mut swarm, &key, &provider_ids) > 0
+                            {
+                                grace_armed = true;
+                                grace
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + DHT_PROVIDER_GRACE);
                             }
                         }
                         QueryResult::GetProviders(Ok(GetProvidersOk::FinishedWithNoAdditionalRecord { .. })) => {
@@ -1580,6 +1600,7 @@ struct DhtBehaviour {
 
 #[cfg(not(target_os = "wasi"))]
 async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBehaviour>> {
+    let tuning = DhtTuning::from_env();
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -1602,15 +1623,13 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
         )
         .map_err(|err| RoutingError::Dht(err.to_string()))?
         .with_behaviour(move |key, relay_client| {
-            dht_behaviour(key.public(), query_timeout, relay_client)
+            dht_behaviour(key.public(), query_timeout, relay_client, tuning)
         })
         .map_err(|err| RoutingError::Dht(err.to_string()))
         .map(|builder| {
             builder
-                .with_swarm_config(|cfg| {
-                    cfg.with_idle_connection_timeout(DHT_IDLE_CONNECTION_TIMEOUT)
-                })
-                .with_connection_timeout(DHT_CONNECTION_TIMEOUT)
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(tuning.idle_timeout))
+                .with_connection_timeout(tuning.connection_timeout)
                 .build()
         })
 }
@@ -1639,6 +1658,7 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
     use libp2p::core::upgrade::Version;
     use libp2p::identity::Keypair;
 
+    let tuning = DhtTuning::from_env();
     let keypair = Keypair::generate_ed25519();
     let local_peer_id = keypair.public().to_peer_id();
 
@@ -1667,16 +1687,16 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
     let transport = relay_transport
         .or_transport(transport)
         .map(|either, _| either.into_inner());
-    let transport = TransportTimeout::new(transport, DHT_CONNECTION_TIMEOUT).boxed();
+    let transport = TransportTimeout::new(transport, tuning.connection_timeout).boxed();
 
     let swarm_cfg = libp2p::swarm::Config::with_executor(|fut| {
         tokio::spawn(fut);
     })
-    .with_idle_connection_timeout(DHT_IDLE_CONNECTION_TIMEOUT);
+    .with_idle_connection_timeout(tuning.idle_timeout);
 
     Ok(libp2p::Swarm::new(
         transport,
-        dht_behaviour(keypair.public(), query_timeout, relay_client),
+        dht_behaviour(keypair.public(), query_timeout, relay_client, tuning),
         local_peer_id,
         swarm_cfg,
     ))
@@ -1686,12 +1706,16 @@ fn dht_behaviour(
     public_key: libp2p::identity::PublicKey,
     query_timeout: Duration,
     relay_client: libp2p::relay::client::Behaviour,
+    tuning: DhtTuning,
 ) -> DhtBehaviour {
     let peer_id = public_key.to_peer_id();
     let store = MemoryStore::new(peer_id);
     let mut config = kad::Config::new(kad::PROTOCOL_NAME);
     config.set_query_timeout(query_timeout);
     config.set_periodic_bootstrap_interval(None);
+    config.set_parallelism(
+        std::num::NonZeroUsize::new(tuning.parallelism).unwrap_or(std::num::NonZeroUsize::MIN),
+    );
     let mut behaviour = kad::Behaviour::with_config(peer_id, store, config);
     behaviour.set_mode(Some(kad::Mode::Client));
     DhtBehaviour {
@@ -1701,9 +1725,25 @@ fn dht_behaviour(
             public_key,
         )),
         ping: ping::Behaviour::new(ping::Config::new()),
-        limits: connection_limits::Behaviour::new(dht_connection_limits()),
+        limits: connection_limits::Behaviour::new(dht_connection_limits(tuning)),
         relay_client,
     }
+}
+
+/// How many of `provider_ids` the lookup has heard an address for.
+fn reachable_provider_count(
+    swarm: &mut libp2p::Swarm<DhtBehaviour>,
+    key: &kad::RecordKey,
+    provider_ids: &HashSet<PeerId>,
+) -> usize {
+    swarm
+        .behaviour_mut()
+        .kad
+        .store_mut()
+        .providers(key)
+        .iter()
+        .filter(|record| provider_ids.contains(&record.provider) && !record.addresses.is_empty())
+        .count()
 }
 
 fn providers_from_dht(
@@ -1731,12 +1771,60 @@ fn providers_from_dht(
     Ok(providers)
 }
 
-fn dht_connection_limits() -> connection_limits::ConnectionLimits {
+fn dht_connection_limits(tuning: DhtTuning) -> connection_limits::ConnectionLimits {
     connection_limits::ConnectionLimits::default()
-        .with_max_pending_outgoing(Some(DHT_MAX_PENDING_OUTGOING_CONNECTIONS))
-        .with_max_established_outgoing(Some(DHT_MAX_ESTABLISHED_CONNECTIONS))
-        .with_max_established(Some(DHT_MAX_ESTABLISHED_CONNECTIONS))
+        .with_max_pending_outgoing(Some(tuning.pending_outgoing))
+        .with_max_established_outgoing(Some(tuning.established))
+        .with_max_established(Some(tuning.established))
         .with_max_established_per_peer(Some(1))
+}
+
+/// How wide and how patient a light DHT walk is. The defaults are the values above; the
+/// `ORIVON_IPFS_DHT_*` environment variables replace them for a measurement.
+#[derive(Debug, Clone, Copy)]
+struct DhtTuning {
+    parallelism: usize,
+    connection_timeout: Duration,
+    idle_timeout: Duration,
+    pending_outgoing: u32,
+    established: u32,
+}
+
+impl Default for DhtTuning {
+    fn default() -> Self {
+        Self {
+            parallelism: DHT_PARALLELISM,
+            connection_timeout: DHT_CONNECTION_TIMEOUT,
+            idle_timeout: DHT_IDLE_CONNECTION_TIMEOUT,
+            pending_outgoing: DHT_MAX_PENDING_OUTGOING_CONNECTIONS,
+            established: DHT_MAX_ESTABLISHED_CONNECTIONS,
+        }
+    }
+}
+
+impl DhtTuning {
+    fn from_env() -> Self {
+        fn number(name: &str) -> Option<u64> {
+            std::env::var(name).ok()?.trim().parse().ok()
+        }
+        let mut tuning = Self::default();
+        if let Some(n) = number("ORIVON_IPFS_DHT_PARALLELISM") {
+            tuning.parallelism = n.clamp(1, 64) as usize;
+        }
+        if let Some(ms) = number("ORIVON_IPFS_DHT_CONNECT_TIMEOUT_MS") {
+            tuning.connection_timeout = Duration::from_millis(ms.clamp(500, 60_000));
+        }
+        if let Some(ms) = number("ORIVON_IPFS_DHT_IDLE_TIMEOUT_MS") {
+            tuning.idle_timeout = Duration::from_millis(ms.clamp(500, 120_000));
+        }
+        if let Some(n) = number("ORIVON_IPFS_DHT_PENDING_CONNECTIONS") {
+            tuning.pending_outgoing = n.clamp(1, 256) as u32;
+        }
+        if let Some(n) = number("ORIVON_IPFS_DHT_CONNECTIONS") {
+            tuning.established = n.clamp(1, 256) as u32;
+        }
+        tuning
+    }
 }
 
 /// What happened on the wire during one provider walk, logged once when it ends.
