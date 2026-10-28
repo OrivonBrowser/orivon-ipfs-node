@@ -933,11 +933,15 @@ impl LightDhtClient {
     }
 
     async fn providers_inner(&self, cid: &Cid) -> Result<Vec<Provider>> {
+        let started = Instant::now();
         let mut swarm = self.bootstrapped_swarm().await?;
+        let swarm_ready_ms = started.elapsed().as_millis();
 
         let key = kad::RecordKey::new(&cid.hash().to_bytes());
         let query_id = swarm.behaviour_mut().kad.get_providers(key.clone());
         let mut provider_ids = HashSet::new();
+        let mut walk = WalkTally::default();
+        let mut ended = "deadline";
         let deadline = tokio::time::sleep(self.query_timeout);
         tokio::pin!(deadline);
 
@@ -947,26 +951,43 @@ impl LightDhtClient {
                     break;
                 }
                 event = swarm.select_next_some() => {
-                    let Some(kad::Event::OutboundQueryProgressed { id, result, .. }) = dht_event(event) else {
+                    walk.observe(&event, started);
+                    let Some(kad::Event::OutboundQueryProgressed { id, result, stats, .. }) = dht_event(event) else {
                         continue;
                     };
                     if id != query_id {
                         continue;
                     }
+                    walk.requests = stats.num_requests();
+                    walk.successes = stats.num_successes();
+                    walk.failures = stats.num_failures();
                     match result {
                         QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { providers, .. })) => {
+                            tracing::info!(
+                                phase = "dht_walk_found",
+                                cid = %cid,
+                                providers = providers.len(),
+                                requests = walk.requests,
+                                successes = walk.successes,
+                                failures = walk.failures,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
                             provider_ids.extend(providers);
                             if provider_ids.len() >= self.max_providers {
+                                ended = "enough";
                                 break;
                             }
                         }
                         QueryResult::GetProviders(Ok(GetProvidersOk::FinishedWithNoAdditionalRecord { .. })) => {
+                            ended = "finished";
                             break;
                         }
                         QueryResult::GetProviders(Err(err)) => {
                             if provider_ids.is_empty() {
+                                walk.log(cid, "failed", started, swarm_ready_ms, 0, 0);
                                 return Err(RoutingError::Dht(err.to_string()));
                             }
+                            ended = "failed";
                             break;
                         }
                         _ => {}
@@ -975,8 +996,20 @@ impl LightDhtClient {
             }
         }
 
+        let found = provider_ids.len();
         let providers = providers_from_dht(&mut swarm, &key, provider_ids, self.max_providers)?;
-        resolve_missing_provider_addresses(&mut swarm, providers, self.query_timeout).await
+        let without_addresses = providers.iter().filter(|p| p.addrs.is_empty()).count();
+        let providers =
+            resolve_missing_provider_addresses(&mut swarm, providers, self.query_timeout).await?;
+        walk.log(
+            cid,
+            ended,
+            started,
+            swarm_ready_ms,
+            found,
+            without_addresses,
+        );
+        Ok(providers)
     }
 
     pub async fn records(&self, key: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -1704,6 +1737,75 @@ fn dht_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established_outgoing(Some(DHT_MAX_ESTABLISHED_CONNECTIONS))
         .with_max_established(Some(DHT_MAX_ESTABLISHED_CONNECTIONS))
         .with_max_established_per_peer(Some(1))
+}
+
+/// What happened on the wire during one provider walk, logged once when it ends.
+#[derive(Default)]
+struct WalkTally {
+    requests: u32,
+    successes: u32,
+    failures: u32,
+    connected: u32,
+    dial_errors: u32,
+    dial_denied: u32,
+    first_error: Option<String>,
+    first_connection_ms: Option<u128>,
+}
+
+impl WalkTally {
+    fn observe(&mut self, event: &SwarmEvent<DhtBehaviourEvent>, started: Instant) {
+        match event {
+            SwarmEvent::ConnectionEstablished { .. } => {
+                self.connected += 1;
+                if self.first_connection_ms.is_none() {
+                    self.first_connection_ms = Some(started.elapsed().as_millis());
+                }
+            }
+            SwarmEvent::OutgoingConnectionError { error, .. } => {
+                self.dial_errors += 1;
+                if matches!(error, libp2p::swarm::DialError::Denied { .. }) {
+                    self.dial_denied += 1;
+                }
+                if self.first_error.is_none() {
+                    self.first_error = Some(error.to_string());
+                }
+                tracing::debug!(
+                    phase = "dht_walk_dial_error",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %error
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn log(
+        &self,
+        cid: &Cid,
+        ended: &str,
+        started: Instant,
+        swarm_ready_ms: u128,
+        providers_found: usize,
+        without_addresses: usize,
+    ) {
+        tracing::info!(
+            phase = "dht_walk",
+            cid = %cid,
+            ended,
+            providers_found,
+            without_addresses,
+            requests = self.requests,
+            successes = self.successes,
+            failures = self.failures,
+            connected = self.connected,
+            dial_errors = self.dial_errors,
+            dial_denied = self.dial_denied,
+            first_connection_ms = self.first_connection_ms.map(|ms| ms as u64),
+            first_error = self.first_error.as_deref().unwrap_or(""),
+            swarm_ready_ms,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+    }
 }
 
 fn dht_event(event: SwarmEvent<DhtBehaviourEvent>) -> Option<kad::Event> {
@@ -2983,6 +3085,42 @@ mod tests {
         swarm_task.abort();
     }
 
+    /// A share's server is a DHT client behind a relay: no routing table lists it, so the only
+    /// place its address can come from is the answer of the server that holds its record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn light_dht_finds_a_provider_that_is_only_a_dht_client() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (server_id, server_addr, server_task) = spawn_local_dht_server().await;
+        let (provider_id, provider_addr, provider_task) =
+            spawn_dht_client_provider(cid, server_id, server_addr.clone()).await;
+        let bootstrap = format!("{server_addr}/p2p/{server_id}");
+
+        let providers = LightDhtClient::new(vec![bootstrap])
+            .with_query_timeout(Duration::from_secs(8))
+            .with_max_providers(1)
+            .providers(&cid)
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 1, "providers: {providers:?}");
+        assert_eq!(
+            providers[0].id.as_deref(),
+            Some(provider_id.to_string().as_str())
+        );
+        assert!(
+            providers[0]
+                .addrs
+                .iter()
+                .any(|addr| addr == &provider_addr.to_string()),
+            "addresses: {:?}",
+            providers[0].addrs
+        );
+        server_task.abort();
+        provider_task.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn dht_ipns_resolver_reads_verified_record_from_local_server_peer() {
         let value = "/ipfs/bafkqaddwgevxmmraojswg33smq";
@@ -3086,6 +3224,89 @@ mod tests {
                 let _ = swarm.select_next_some().await;
             }
         });
+        (peer_id, addr, task)
+    }
+
+    async fn spawn_local_dht_server() -> (PeerId, Multiaddr, tokio::task::JoinHandle<()>) {
+        let mut swarm = build_local_dht_server().await;
+        let peer_id = *swarm.local_peer_id();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                break address;
+            }
+        };
+        let task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        (peer_id, addr, task)
+    }
+
+    /// A DHT client that announces `cid` on the server and is listed in no routing table.
+    async fn spawn_dht_client_provider(
+        cid: Cid,
+        server_id: PeerId,
+        server_addr: Multiaddr,
+    ) -> (PeerId, Multiaddr, tokio::task::JoinHandle<()>) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|key| {
+                let peer_id = key.public().to_peer_id();
+                let store = MemoryStore::new(peer_id);
+                let mut config = kad::Config::new(kad::PROTOCOL_NAME);
+                config.set_query_timeout(Duration::from_secs(5));
+                config.set_periodic_bootstrap_interval(None);
+                let mut behaviour = kad::Behaviour::with_config(peer_id, store, config);
+                behaviour.set_mode(Some(kad::Mode::Client));
+                behaviour
+            })
+            .unwrap()
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                break address;
+            }
+        };
+        swarm.add_external_address(addr.clone());
+        swarm.behaviour_mut().add_address(&server_id, server_addr);
+        let key = kad::RecordKey::new(&cid.hash().to_bytes());
+        swarm.behaviour_mut().start_providing(key).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                    result: QueryResult::StartProviding(result),
+                    ..
+                }) = swarm.select_next_some().await
+                {
+                    result.expect("the server stored the announcement");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the announcement finished");
+        let task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        // The server reads the announcement after the provider has sent it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         (peer_id, addr, task)
     }
 
