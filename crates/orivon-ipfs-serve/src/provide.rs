@@ -4,11 +4,12 @@
 //! reports back how each announcement went.
 
 use cid::Cid;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// CIDs the node announces at once; one more is refused.
+/// CIDs the node announces at once. That many roots, or CIDs asked for by name, always fit: a CID
+/// that is only listed under a root gives way to them, and one more named CID is refused.
 pub const MAX_PROVIDED: usize = 1024;
 /// How often a provider record is renewed, as Kubo does.
 pub const REANNOUNCE_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
@@ -59,12 +60,27 @@ struct Entry {
     announced: Option<u64>,
     due: Instant,
     announcing: bool,
-    /// Asked for by its own name, with [`Provided::add`] or as the root of a tree.
+    /// Asked for by its own name, which is what a root of [`Provided::add_tree`] is.
     named: bool,
     /// How many trees list it. It stays announced while it is named or listed.
     listed: u32,
     /// When it was given, so the first CID given is announced first among those due together.
     order: u64,
+}
+
+/// What one root asked to have announced with it, and how much of that the table holds.
+struct Tree {
+    /// The members the last call listed, breadth first, without the root or repeats.
+    wanted: Vec<Cid>,
+    /// The keys of the members of `wanted` the table lists under this root now.
+    listed: HashSet<Vec<u8>>,
+}
+
+impl Tree {
+    /// Some member it asked for is not in the table.
+    fn is_cut(&self) -> bool {
+        self.listed.len() < self.wanted.len()
+    }
 }
 
 /// What [`Provided::add_tree`] did.
@@ -73,7 +89,8 @@ pub struct TreeAdded {
     pub outcome: AddOutcome,
     /// Members now listed under the root.
     pub listed: usize,
-    /// CIDs the root listed before and nothing lists now, so the DHT should stop providing them.
+    /// CIDs that are no longer announced at all, so the DHT should stop providing them: what the
+    /// root listed before and nothing lists now, and what was pushed out to make room for the root.
     pub dropped: Vec<Cid>,
 }
 
@@ -94,8 +111,8 @@ pub fn provider_key(cid: &Cid) -> Vec<u8> {
 
 pub struct Provided {
     entries: HashMap<Vec<u8>, Entry>,
-    /// For each root given to [`Provided::add_tree`], the keys of the CIDs it lists.
-    trees: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// For each root given to [`Provided::add_tree`], what it asked for and what the table lists.
+    trees: HashMap<Vec<u8>, Tree>,
     next_order: u64,
     reachability: Reachability,
     /// A relay holds a reservation for the node, so peers can reach it through the relay whatever
@@ -122,7 +139,22 @@ impl Provided {
         }
     }
 
+    /// `name` without the list of what it pushed out, for the table's own tests: the node names a
+    /// CID through [`Provided::add_tree`].
+    #[cfg(test)]
     pub fn add(&mut self, cid: Cid, now: Instant) -> Result<AddOutcome, TooMany> {
+        self.name(cid, now, &mut Vec::new())
+    }
+
+    /// Asks for `cid` by its own name. A CID named always fits while fewer than `max` CIDs are
+    /// named: when the table is full, one that is only listed under a root is pushed out, and
+    /// goes into `pushed_out`. Refused only when every CID held is named.
+    fn name(
+        &mut self,
+        cid: Cid,
+        now: Instant,
+        pushed_out: &mut Vec<Cid>,
+    ) -> Result<AddOutcome, TooMany> {
         let key = provider_key(&cid);
         if let Some(entry) = self.entries.get_mut(&key) {
             return Ok(if std::mem::replace(&mut entry.named, true) {
@@ -132,30 +164,35 @@ impl Provided {
             });
         }
         if self.entries.len() >= self.max {
-            return Err(TooMany);
+            pushed_out.push(self.push_out().ok_or(TooMany)?);
         }
         self.insert(cid, now, true);
         Ok(AddOutcome::Added)
     }
 
-    /// Names `root` like [`Provided::add`] and lists `members` under it: they are announced for as
-    /// long as the root is, however many roots list the same one. A member that does not fit under
-    /// the limit is left out, never the root. Giving the same root again replaces its list.
+    /// Names `root` like `name` and lists `members` under it: they are announced for as
+    /// long as the root is, however many roots list the same one. A member takes only room that is
+    /// free: one that does not fit is left out, never the root, which pushes a listed CID of
+    /// another root out when the table is full. Giving the same root again replaces its list.
     pub fn add_tree(
         &mut self,
         root: Cid,
         members: &[Cid],
         now: Instant,
     ) -> Result<TreeAdded, TooMany> {
-        let outcome = self.add(root, now)?;
+        let mut dropped = Vec::new();
+        let outcome = self.name(root, now, &mut dropped)?;
         let root_key = provider_key(&root);
-        let previous = self.trees.remove(&root_key).unwrap_or_default();
-        let mut listed: Vec<Vec<u8>> = Vec::new();
+        let previous = self.trees.remove(&root_key);
+        let mut seen = HashSet::from([root_key.clone()]);
+        let mut wanted = Vec::new();
+        let mut listed = HashSet::new();
         for member in members {
             let key = provider_key(member);
-            if key == root_key || listed.contains(&key) {
+            if !seen.insert(key.clone()) {
                 continue;
             }
+            wanted.push(*member);
             if let Some(entry) = self.entries.get_mut(&key) {
                 entry.listed += 1;
             } else if self.entries.len() < self.max {
@@ -163,16 +200,97 @@ impl Provided {
             } else {
                 continue;
             }
-            listed.push(key);
+            listed.insert(key);
         }
-        let dropped = previous.iter().filter_map(|key| self.unlist(key)).collect();
-        let count = listed.len();
-        self.trees.insert(root_key, listed);
+        for key in previous.iter().flat_map(|tree| tree.listed.iter()) {
+            dropped.extend(self.unlist(key));
+        }
+        self.trees.insert(root_key.clone(), Tree { wanted, listed });
+        self.top_up(now);
+        // A CID pushed out and listed again by the same call is still announced.
+        dropped.retain(|cid| !self.entries.contains_key(&provider_key(cid)));
+        let listed = self.trees.get(&root_key).map_or(0, |tree| tree.listed.len());
         Ok(TreeAdded {
             outcome,
-            listed: count,
+            listed,
             dropped,
         })
+    }
+
+    /// Removes one CID that is only listed, never a named one. It comes from the tree that lists
+    /// the most members (the newer root when trees are level), and is that tree's newest entry.
+    /// None when every CID held is named.
+    fn push_out(&mut self) -> Option<Cid> {
+        let root = self
+            .trees
+            .iter()
+            .filter(|(_, tree)| tree.listed.iter().any(|key| self.is_only_listed(key)))
+            .max_by_key(|(root, tree)| (tree.listed.len(), self.order_of(root)))
+            .map(|(root, _)| root.clone())?;
+        let key = self.trees[&root]
+            .listed
+            .iter()
+            .filter(|key| self.is_only_listed(key))
+            .max_by_key(|key| self.order_of(key))?
+            .clone();
+        let entry = self.entries.remove(&key)?;
+        for tree in self.trees.values_mut() {
+            tree.listed.remove(&key);
+        }
+        Some(entry.cid)
+    }
+
+    /// The CID under `key` is held, and no call asked for it by its own name.
+    fn is_only_listed(&self, key: &[u8]) -> bool {
+        self.entries.get(key).is_some_and(|entry| !entry.named)
+    }
+
+    fn order_of(&self, key: &[u8]) -> u64 {
+        self.entries.get(key).map_or(0, |entry| entry.order)
+    }
+
+    /// While the table has room, lists what the trees that were cut asked for: the tree that holds
+    /// the fewest members first (the older root when trees are level), one member at a time, in the
+    /// order the root listed them.
+    fn top_up(&mut self, now: Instant) {
+        while self.entries.len() < self.max {
+            let Some(root) = self
+                .trees
+                .iter()
+                .filter(|(_, tree)| tree.is_cut())
+                .min_by_key(|(root, tree)| (tree.listed.len(), self.order_of(root)))
+                .map(|(root, _)| root.clone())
+            else {
+                return;
+            };
+            self.list_next(&root, now);
+        }
+    }
+
+    /// Lists the first member `root` asked for that the table does not list under it yet.
+    fn list_next(&mut self, root: &[u8], now: Instant) {
+        let next = {
+            let Some(tree) = self.trees.get_mut(root) else {
+                return;
+            };
+            let next = tree
+                .wanted
+                .iter()
+                .map(|member| (*member, provider_key(member)))
+                .find(|(_, key)| !tree.listed.contains(key));
+            if let Some((_, key)) = &next {
+                tree.listed.insert(key.clone());
+            }
+            next
+        };
+        let Some((member, key)) = next else {
+            return;
+        };
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.listed += 1;
+        } else {
+            self.insert(member, now, false).listed = 1;
+        }
     }
 
     fn insert(&mut self, cid: Cid, now: Instant, named: bool) -> &mut Entry {
@@ -202,8 +320,9 @@ impl Provided {
         Some(cid)
     }
 
-    /// Stops announcing `cid` by name, and what it listed unless another root lists it too.
-    pub fn remove(&mut self, cid: &Cid) -> Removed {
+    /// Stops announcing `cid` by name, and what it listed unless another root lists it too. The
+    /// room this frees goes to the trees that were cut.
+    pub fn remove(&mut self, cid: &Cid, now: Instant) -> Removed {
         let key = provider_key(cid);
         let was_named = self
             .entries
@@ -215,10 +334,8 @@ impl Provided {
                 dropped: Vec::new(),
             };
         }
-        let mut dropped: Vec<Cid> = self
-            .trees
-            .remove(&key)
-            .unwrap_or_default()
+        let listed = self.trees.remove(&key).map(|tree| tree.listed).unwrap_or_default();
+        let mut dropped: Vec<Cid> = listed
             .iter()
             .filter_map(|member| self.unlist(member))
             .collect();
@@ -226,6 +343,7 @@ impl Provided {
             self.entries.remove(&key);
             dropped.insert(0, *cid);
         }
+        self.top_up(now);
         Removed {
             was_named,
             dropped,
@@ -506,8 +624,8 @@ mod tests {
             Ok(AddOutcome::AlreadyProvided)
         );
         assert_eq!(provided.add(cid(b"c"), now), Err(TooMany));
-        assert!(provided.remove(&cid(b"a")).was_named);
-        assert!(!provided.remove(&cid(b"a")).was_named);
+        assert!(provided.remove(&cid(b"a"), now).was_named);
+        assert!(!provided.remove(&cid(b"a"), now).was_named);
         assert_eq!(provided.add(cid(b"c"), now), Ok(AddOutcome::Added));
         assert_eq!(MAX_PROVIDED, 1024);
     }
@@ -520,7 +638,7 @@ mod tests {
         assert_eq!(provider_key(&v0), provider_key(&v1));
         provided.add(v1, now).unwrap();
         assert_eq!(provided.add(v0, now), Ok(AddOutcome::AlreadyProvided));
-        assert!(provided.remove(&v0).was_named);
+        assert!(provided.remove(&v0, now).was_named);
         assert!(provided.snapshot().is_empty());
     }
 
@@ -531,7 +649,7 @@ mod tests {
         let a = cid(b"a");
         provided.add(a, now).unwrap();
         provided.take_due(now, 4);
-        provided.remove(&a);
+        provided.remove(&a, now);
         provided.announced(&a, now, 1);
         provided.failed(&a, now);
         assert!(provided.snapshot().is_empty());
@@ -582,12 +700,12 @@ mod tests {
         let members = ids(&[b"one", b"two"]);
         let root = cid(b"root");
         provided.add_tree(root, &members, now).unwrap();
-        let removed = provided.remove(&root);
+        let removed = provided.remove(&root, now);
         assert!(removed.was_named);
         assert_eq!(removed.dropped.len(), 3);
         assert!(removed.dropped.contains(&root));
         assert!(provided.snapshot().is_empty());
-        assert!(!provided.remove(&root).was_named);
+        assert!(!provided.remove(&root, now).was_named);
     }
 
     #[test]
@@ -597,10 +715,10 @@ mod tests {
         let (first, second) = (cid(b"first"), cid(b"second"));
         provided.add_tree(first, &[shared], now).unwrap();
         provided.add_tree(second, &[shared], now).unwrap();
-        let removed = provided.remove(&first);
+        let removed = provided.remove(&first, now);
         assert_eq!(removed.dropped, vec![first]);
         assert_eq!(provided.snapshot().len(), 2);
-        let removed = provided.remove(&second);
+        let removed = provided.remove(&second, now);
         assert_eq!(removed.dropped.len(), 2);
         assert!(provided.snapshot().is_empty());
     }
@@ -612,10 +730,10 @@ mod tests {
         let root = cid(b"root");
         provided.add_tree(root, &[member], now).unwrap();
         assert_eq!(provided.add(member, now), Ok(AddOutcome::Added));
-        let removed = provided.remove(&root);
+        let removed = provided.remove(&root, now);
         assert_eq!(removed.dropped, vec![root]);
         assert_eq!(provided.snapshot().len(), 1);
-        assert!(provided.remove(&member).was_named);
+        assert!(provided.remove(&member, now).was_named);
         assert!(provided.snapshot().is_empty());
     }
 
@@ -624,7 +742,7 @@ mod tests {
         let (mut provided, now) = state();
         let member = cid(b"member");
         provided.add_tree(cid(b"root"), &[member], now).unwrap();
-        assert!(!provided.remove(&member).was_named);
+        assert!(!provided.remove(&member, now).was_named);
         assert_eq!(provided.snapshot().len(), 2);
     }
 
@@ -653,17 +771,194 @@ mod tests {
         assert_eq!(by(&gone), None);
     }
 
+    fn holds(provided: &Provided, cid: &Cid) -> bool {
+        provided
+            .snapshot()
+            .iter()
+            .any(|entry| entry.cid == cid.to_string())
+    }
+
     #[test]
-    fn a_tree_fills_the_table_but_never_pushes_out_its_root() {
+    fn a_tree_fills_the_table_and_a_new_root_still_fits() {
         let mut provided = Provided::with_max(REANNOUNCE_EVERY, 4);
         let now = Instant::now();
         let members = ids(&[b"1", b"2", b"3", b"4", b"5"]);
         let added = provided.add_tree(cid(b"root"), &members, now).unwrap();
         assert_eq!(added.listed, 3);
         assert_eq!(provided.snapshot().len(), 4);
+        let other = provided.add_tree(cid(b"other"), &members, now).unwrap();
+        assert_eq!(other.outcome, AddOutcome::Added);
+        assert_eq!(other.dropped, vec![members[2]]);
+        assert_eq!(other.listed, 2, "it lists what is held and takes no room for the rest");
+        assert_eq!(provided.snapshot().len(), 4);
+    }
+
+    #[test]
+    fn a_new_root_pushes_out_the_newest_member_when_the_table_is_full() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 6);
+        let now = Instant::now();
+        let members = ids(&[b"m1", b"m2", b"m3", b"m4", b"m5"]);
+        let first = cid(b"first");
+        assert_eq!(provided.add_tree(first, &members, now).unwrap().listed, 5);
+        assert_eq!(provided.snapshot().len(), 6);
+
+        let second = cid(b"second");
+        let added = provided.add_tree(second, &[], now).unwrap();
+        assert_eq!(added.outcome, AddOutcome::Added);
+        assert_eq!(added.dropped, vec![members[4]]);
+        assert_eq!(provided.snapshot().len(), 6);
+        assert!(holds(&provided, &second));
+        assert!(holds(&provided, &first));
+        assert!(holds(&provided, &members[3]));
+        assert!(!holds(&provided, &members[4]));
+
+        let again = provided.add_tree(first, &members, now).unwrap();
+        assert_eq!(again.outcome, AddOutcome::AlreadyProvided);
+        assert_eq!(again.listed, 4, "the tree that gave way reports one member fewer");
+        assert!(again.dropped.is_empty());
+        assert!(!holds(&provided, &members[4]), "giving the root again takes no one's place");
+    }
+
+    #[test]
+    fn the_tree_that_lists_the_most_gives_way_first() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 7);
+        let now = Instant::now();
+        let big = ids(&[b"b1", b"b2", b"b3", b"b4"]);
+        let small = ids(&[b"s1"]);
+        provided.add_tree(cid(b"big"), &big, now).unwrap();
+        provided.add_tree(cid(b"small"), &small, now).unwrap();
+        assert_eq!(provided.snapshot().len(), 7);
+        let third = provided.add_tree(cid(b"third"), &[], now).unwrap();
+        assert_eq!(third.dropped, vec![big[3]]);
+        let fourth = provided.add_tree(cid(b"fourth"), &[], now).unwrap();
+        assert_eq!(fourth.dropped, vec![big[2]]);
+        assert!(holds(&provided, &small[0]));
+    }
+
+    #[test]
+    fn of_two_level_trees_the_newer_gives_way() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 4);
+        let now = Instant::now();
+        let (x, y) = (cid(b"x"), cid(b"y"));
+        provided.add_tree(cid(b"older"), &[x], now).unwrap();
+        provided.add_tree(cid(b"newer"), &[y], now).unwrap();
+        let added = provided.add_tree(cid(b"third"), &[], now).unwrap();
+        assert_eq!(added.dropped, vec![y]);
+    }
+
+    #[test]
+    fn a_member_two_roots_list_leaves_both_when_it_is_pushed_out() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 4);
+        let now = Instant::now();
+        let (p, shared) = (cid(b"p"), cid(b"shared"));
+        let (x, y) = (cid(b"x"), cid(b"y"));
+        provided.add_tree(x, &[p, shared], now).unwrap();
+        provided.add_tree(y, &[shared], now).unwrap();
+        assert_eq!(provided.snapshot().len(), 4);
+        let added = provided.add_tree(cid(b"z"), &[], now).unwrap();
+        assert_eq!(added.dropped, vec![shared]);
+        assert!(!holds(&provided, &shared));
+        assert_eq!(provided.add_tree(y, &[shared], now).unwrap().listed, 0);
+        assert_eq!(provided.add_tree(x, &[p, shared], now).unwrap().listed, 1);
+    }
+
+    #[test]
+    fn named_cids_push_out_every_listed_one_and_then_the_limit_holds() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 4);
+        let now = Instant::now();
+        let members = ids(&[b"m1", b"m2", b"m3"]);
+        let first = cid(b"first");
+        provided.add_tree(first, &members, now).unwrap();
+        for name in [b"n1", b"n2", b"n3"] {
+            assert_eq!(provided.add(cid(name), now), Ok(AddOutcome::Added));
+        }
+        assert_eq!(provided.snapshot().len(), 4);
+        for member in &members {
+            assert!(!holds(&provided, member));
+        }
+        assert_eq!(provided.add(cid(b"n4"), now), Err(TooMany));
         assert_eq!(
-            provided.add_tree(cid(b"other"), &members, now),
-            Err(TooMany)
+            provided.add_tree(cid(b"n5"), &[], now),
+            Err(TooMany),
+            "a root is refused the same way"
         );
+        assert!(holds(&provided, &first), "a root is never pushed out");
+        assert!(provided.remove(&cid(b"n1"), now).was_named);
+        assert_eq!(provided.add(cid(b"n4"), now), Ok(AddOutcome::Added));
+    }
+
+    #[test]
+    fn a_member_asked_for_by_name_is_not_pushed_out() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 3);
+        let now = Instant::now();
+        let members = ids(&[b"m1", b"m2"]);
+        provided.add_tree(cid(b"first"), &members, now).unwrap();
+        assert_eq!(provided.add(members[1], now), Ok(AddOutcome::Added));
+        let added = provided.add_tree(cid(b"second"), &[], now).unwrap();
+        assert_eq!(added.dropped, vec![members[0]]);
+        assert!(holds(&provided, &members[1]));
+        assert_eq!(provided.add_tree(cid(b"third"), &[], now), Err(TooMany));
+    }
+
+    #[test]
+    fn room_freed_by_a_delete_goes_back_to_the_tree_that_was_cut() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 6);
+        let now = Instant::now();
+        let members = ids(&[b"a1", b"a2", b"a3", b"a4", b"a5"]);
+        let (first, second) = (cid(b"first"), cid(b"second"));
+        provided.add_tree(first, &members, now).unwrap();
+        let added = provided.add_tree(second, &ids(&[b"b1", b"b2"]), now).unwrap();
+        assert_eq!(added.dropped, vec![members[4]]);
+        assert_eq!(added.listed, 0, "a new root's members take only room that is free");
+        assert!(!holds(&provided, &members[4]));
+
+        let removed = provided.remove(&second, now);
+        assert_eq!(removed.dropped, vec![second]);
+        assert!(holds(&provided, &members[4]), "the cut tree is topped up");
+        assert_eq!(provided.snapshot().len(), 6);
+        assert_eq!(provided.add_tree(first, &members, now).unwrap().listed, 5);
+    }
+
+    #[test]
+    fn freed_room_goes_to_the_cut_tree_holding_the_fewest_members_first() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 7);
+        let now = Instant::now();
+        let a = ids(&[b"a1", b"a2", b"a3", b"a4", b"a5", b"a6"]);
+        let b = ids(&[b"b1", b"b2"]);
+        let c = ids(&[b"c1"]);
+        let (root_a, root_b, root_c) = (cid(b"root a"), cid(b"root b"), cid(b"root c"));
+        provided.add_tree(root_a, &a, now).unwrap();
+        provided.add_tree(root_b, &b, now).unwrap();
+        provided.add_tree(root_c, &c, now).unwrap();
+        for lost in [&a[5], &a[4], &b[0], &c[0]] {
+            assert!(!holds(&provided, lost));
+        }
+
+        provided.remove(&root_c, now);
+        assert!(holds(&provided, &b[0]), "b holds none, a holds four");
+        assert!(!holds(&provided, &a[4]));
+
+        provided.remove(&root_b, now);
+        assert!(!holds(&provided, &b[0]));
+        assert!(holds(&provided, &a[4]));
+        assert!(holds(&provided, &a[5]));
+        assert_eq!(provided.snapshot().len(), 7);
+    }
+
+    #[test]
+    fn a_cut_tree_is_topped_up_when_a_root_shrinks_its_list() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 5);
+        let now = Instant::now();
+        let a = ids(&[b"a1", b"a2", b"a3", b"a4"]);
+        let b = ids(&[b"b1", b"b2", b"b3"]);
+        provided.add_tree(cid(b"root a"), &a, now).unwrap();
+        provided.add_tree(cid(b"root b"), &b, now).unwrap();
+        assert!(!holds(&provided, &a[3]));
+        assert!(!holds(&provided, &b[0]));
+        let smaller = provided.add_tree(cid(b"root a"), &a[..2], now).unwrap();
+        assert_eq!(smaller.listed, 2);
+        assert_eq!(smaller.dropped, vec![a[2]]);
+        assert!(holds(&provided, &b[0]));
+        assert_eq!(provided.snapshot().len(), 5);
     }
 }
