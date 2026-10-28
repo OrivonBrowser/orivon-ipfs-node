@@ -198,6 +198,18 @@ listener, and `/provide` not on one without a DHT):
   alone announced the answer is nobody, and a fetcher that only offers wants to peers it found as
   providers never asks this node. Announcing costs one DHT store per CID, four at a time, repeated
   every 12 hours, so the table bounds it. Blocks the node does not hold are skipped.
+  **The order.** A place that frees among the four goes to the first of these that has something
+  due. (1) A root that no announcement has reached yet, the earliest call first: a new root is
+  announced as soon as a place frees, as fast as a share made alone, however many entries of other
+  shares wait. (2) A folder, or the first block of a file, that no announcement has reached yet: the
+  roots that listed them take turns, the root served longest ago first, and a root gives the entry
+  that has been due longest. A small share made after a big one is announced in about twice the
+  time its own entries need alone, not after the big one finishes. (3) A renewal: an entry an
+  earlier announcement reached, now due again, the one due longest first. While something under (1)
+  or (2) and a renewal both wait, one place in five goes to the renewal, so renewals neither wait
+  for every first announcement nor hold them back; a new root waits at most for that one place. An
+  announcement that reached no peer is tried again after a minute, still as a first announcement,
+  behind the entries of its root that are already due. Giving a root again keeps its turn.
   **The table.** It holds 1024 CIDs and belongs to the whole node: every root shares it. A CID is in
   it because a call named it (a root, or a CID given with `"tree":false`) or because a root lists it.
   Named CIDs have the first claim: while fewer than 1024 are named, a new root always gets a place,
@@ -211,9 +223,8 @@ listener, and `/provide` not on one without a DHT):
   share that arrives at a full table is announced as its root alone. A call for a root that is
   already named takes no one's place. When a `DELETE /provide/<cid>` frees places, they go back to
   the roots that were cut, the one listing the fewest members first (the older of two level roots),
-  each in its breadth-first order. The root is always announced first. An entry that is not
-  announced is fetched as reliably as any other once a peer has found the root, and is only found
-  by its own CID less often.
+  each in its breadth-first order. An entry that is not announced is fetched as reliably as any
+  other once a peer has found the root, and is only found by its own CID less often.
 - `DELETE /provide/<cid>`: stops announcing it and the entries it brought with it (`200
   {"cid":"<cid>"}`), 404 when it was not being provided. An entry another root, or a call of its own,
   also named stays. Records already published expire on their own (about 48 hours).
