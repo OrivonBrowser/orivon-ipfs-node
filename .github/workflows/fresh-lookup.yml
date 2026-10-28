@@ -31,17 +31,35 @@ env:
   RELAY: /ip4/152.228.138.30/tcp/4003/p2p/12D3KooWReTq9frXSU18aXYvksPBQRWj9qafTSB4gxgUg6QqqnqJ
 
 jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[rig]')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: Pick the runners
+        id: pick
+        env:
+          ONLY: ${{ inputs.os }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          every = [
+              {"os": "ubuntu-latest", "exe": "", "kubo": "linux-amd64.tar.gz"},
+              {"os": "macos-latest", "exe": "", "kubo": "darwin-arm64.tar.gz"},
+              {"os": "windows-latest", "exe": ".exe", "kubo": "windows-amd64.zip"},
+          ]
+          only = os.environ.get("ONLY", "")
+          print("matrix=" + json.dumps({"include": [m for m in every if not only or m["os"] == only]}))
+          PY
+
   rig:
-    if: (github.event_name == 'workflow_dispatch' && (inputs.os == '' || inputs.os == matrix.os)) || contains(github.event.head_commit.message, '[rig]')
+    needs: plan
     runs-on: ${{ matrix.os }}
     timeout-minutes: 100
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, exe: '', kubo: linux-amd64.tar.gz }
-          - { os: macos-latest, exe: '', kubo: darwin-arm64.tar.gz }
-          - { os: windows-latest, exe: .exe, kubo: windows-amd64.zip }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
