@@ -216,11 +216,19 @@ listener, and `/provide` not on one without a DHT):
   last announcement that reached a peer, directly or through a relay reservation.
 
 **Bounds**, on top of every bound above: at most 64 established inbound connections, 4 per peer
-(either direction), 32 inbound connections still being set up, 32 established connections the node
+(either direction), 32 inbound connections still being set up, 128 established connections the node
 opened (peers it keeps, the DHT, AutoNAT servers), 1024 provided CIDs. A connection with no open
 stream closes after 60 seconds, except those to the peers a page asked the node to keep. In this mode
 the node also dials public IP addresses only (names are resolved first), whoever names the address, so
 a DHT peer cannot send it to the local network; `--allow-local-dial` lifts that too.
+
+An announcement walks the DHT through a hundred or so peers, most of which never answer, and holds a
+connection to each that does for that idle minute; the provider record then goes to the twenty
+nearest of them. The outbound limit is sized for that. A limit the walk reaches makes its later dials
+fail, and the record lands on peers far from its key, where no lookup (the light DHT's or Kubo's)
+looks. `--trace-filter orivon_kad_announce=debug` logs, for every announcement, how many peers the
+walk found and how many it sent the record to, and `orivon_ipfs_serve=debug` logs each failed dial
+with the reason, a refusing limit included.
 
 **Known limits.** A computer behind a router that refuses incoming connections stays unreachable:
 AutoNAT says `private`, nothing is announced unless `--relay` gives it a reservation, and the node
@@ -280,6 +288,24 @@ no redirects (a 3xx is a failure), a 2 MiB body limit, a 20 s timeout, the bytes
 before they are stored, and a failing provider is marked bad for a while. `http://` providers (an IP and
 port in the provider record) are read in plaintext; the CID check is what makes that safe.
 
+The light DHT walks the Amino DHT from six bootstrap peers on a swarm of its own, built for the one
+lookup and dropped after it. The walk asks ten peers at a time, holds up to 64 connections and 32
+dials in progress, gives a dial 5 seconds and closes a connection 5 seconds after its last request:
+most peers a walk meets never answer, and a limit it reaches fails the dials that follow, which keeps
+the walk from the peers nearest the key. A provider that is itself a DHT client (a node behind a
+relay, as `--serve` is) is in no routing table, so the only address of it is the one in the record the
+server returned; the walk keeps those addresses, and ends 250 ms after the first provider it has an
+address for. With `--trace-filter orivon_ipfs_routing=info` every walk logs one `dht_walk` line: its
+requests, answers and failures, the dials a limit refused, and how it ended. The width, the limits and
+the timeouts can be replaced for a measurement with `ORIVON_IPFS_DHT_PARALLELISM`,
+`ORIVON_IPFS_DHT_CONNECTIONS`, `ORIVON_IPFS_DHT_PENDING_CONNECTIONS`,
+`ORIVON_IPFS_DHT_CONNECT_TIMEOUT_MS` and `ORIVON_IPFS_DHT_IDLE_TIMEOUT_MS`.
+
+`orivon/fresh-lookup-check.py` times what a user of Share meets: a serve node behind a relay announces
+shares of fresh random bytes, and from the moment the root is announced a second node started like the
+browser's (`node-auto`, `node-dht`) and a Kubo (`kubo-find`, `kubo-cat`) look it up. It needs the node,
+Kubo, the address of a circuit relay and the network, and prints the seconds each took per share.
+
 In `auto` the delegated service and the light DHT are asked at the same time, and the other lookup is
 dropped as soon as one answers with providers. An empty answer from the service is retried once after
 100 ms, with the DHT still running. IPNS records are asked of the service first and then the DHT.
@@ -290,7 +316,9 @@ dropped as soon as one answers with providers. An empty answer from the service 
   (`transport-ipfs-gateway-http`), or through a circuit relay (`/p2p-circuit` with the relay's address and
   id), can serve blocks. Providers reachable only over WSS, QUIC or WebRTC cannot. A block whose
   providers are all of those answers 502 or 504.
-- Provider lookups through the light DHT alone are slow and often find nothing; it is a fallback.
+- The light DHT is a walk through a hundred or so peers on a swarm built for the lookup, so it takes
+  seconds where the delegated service, when it knows the record, takes a fraction of one; both find
+  only what the announcer's walk placed on the nearest peers.
 - The HTTP client resolves names with the host's resolver (`ip-name-lookup`). On a network that
   answers the default delegated service's name with another address, that lookup fails with a
   certificate error and `auto` relies on the DHT.
