@@ -12,6 +12,12 @@ on:
       node_ref:
         description: Build the node from this commit instead (the script stays the branch's)
         default: ''
+      os:
+        description: Run on this runner only (ubuntu-latest, macos-latest or windows-latest); empty runs all three
+        default: ''
+      env:
+        description: NAME=value pairs the rig and the serve node start with, separated by spaces
+        default: ''
   push:
     branches: [fix/fresh-lookup]
 
@@ -26,7 +32,7 @@ env:
 
 jobs:
   rig:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[rig]')
+    if: (github.event_name == 'workflow_dispatch' && (inputs.os == '' || inputs.os == matrix.os)) || contains(github.event.head_commit.message, '[rig]')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 100
     strategy:
@@ -98,7 +104,9 @@ jobs:
         shell: bash
         env:
           EXTRA: ${{ inputs.args }}
+          PAIRS: ${{ inputs.env }}
         run: |
+          for pair in $PAIRS; do export "$pair"; done
           python orivon/fresh-lookup-check.py --node "target/release/orivon-ipfs-gateway${{ matrix.exe }}" \
             --ipfs "$IPFS" --relay "$RELAY" --out "$RUNNER_TEMP/rig-out" $EXTRA 2>&1 | tee "$RUNNER_TEMP/rig.txt"
 
