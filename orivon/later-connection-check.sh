@@ -32,6 +32,7 @@ FETCH_TIMEOUT=${FETCH_TIMEOUT:-40}
 BROADCAST=${BROADCAST:-off}
 ROUTING=${ROUTING:-none}
 ANNOUNCE_WAIT=${ANNOUNCE_WAIT:-240}
+TREE=${TREE:-true}
 FILES=${FILES:-8}
 SCRATCH=${SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/later-connection.XXXXXX")}
 KEY=${KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}
@@ -89,7 +90,7 @@ H=(-H "x-orivon-key: $KEY")
 PEER=$(curl -s "${H[@]}" "$API/id" | json_get peer)
 say "node $PEER"
 curl -s -X POST "${H[@]}" --data-binary @"$SCRATCH/site.car" "$API/blocks" >/dev/null
-say "provide root -> $(curl -s -o /dev/null -w '%{http_code}' -X POST "${H[@]}" -d "{\"cid\":\"$ROOT\"}" "$API/provide")"
+say "provide root (tree=$TREE) -> $(curl -s -o /dev/null -w '%{http_code}' -X POST "${H[@]}" -d "{\"cid\":\"$ROOT\",\"tree\":$TREE}" "$API/provide")"
 announced_all() { curl -s "${H[@]}" "$API/status" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["providing"] and all(e["announced"] for e in d["providing"]) else 1)'; }
 if [ "$VIA" = relay ]; then
   ADDR=""
@@ -170,7 +171,8 @@ kubo_ladder() {
     else
       result "$1" "$2" FAIL "$(python3 -c "print(round($(now)-$started,1))")" "$(head -c 200 "$SCRATCH/cat.err" | tr '\n' ' ')"
       "$IPFS" bitswap stat 2>&1 | head -20
-      "$IPFS" swarm peers 2>&1 | head -5
+      say "kubo has $("$IPFS" swarm peers 2>/dev/null | wc -l) peers; providers of ${CHILD[$2]} by the DHT:"
+      timeout 45 "$IPFS" routing findprovs -n 3 --timeout 30s "${CHILD[$2]}" 2>&1 | head -5
     fi
   }
 

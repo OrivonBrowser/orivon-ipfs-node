@@ -45,12 +45,15 @@ jobs:
       matrix:
         include:
           - { fetcher: kubo, via: relay, routing: dht, broadcast: on }
+          - { fetcher: kubo, via: relay, routing: dht, broadcast: on, tree: "false" }
+          - { fetcher: kubo, via: relay, routing: dht, broadcast: on, idles: "120 0 20 60" }
+          - { fetcher: node, via: relay, routing: none, broadcast: off, tree: "false" }
           - { fetcher: kubo, via: relay, routing: dht, broadcast: off }
           - { fetcher: kubo, via: relay, routing: none, broadcast: off }
           - { fetcher: kubo, via: direct, routing: none, broadcast: off }
           - { fetcher: node, via: relay, routing: none, broadcast: off }
           - { fetcher: node, via: direct, routing: none, broadcast: off }
-    name: ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }}
+    name: ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }} tree ${{ matrix.tree || 'true' }} idles ${{ matrix.idles || 'default' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -78,6 +81,8 @@ jobs:
           VIA: ${{ matrix.via }}
           BROADCAST: ${{ matrix.broadcast }}
           ROUTING: ${{ matrix.routing }}
+          TREE: ${{ matrix.tree || 'true' }}
+          IDLES: ${{ matrix.idles || '0 20 60 120' }}
           LOG_DIR: ${{ runner.temp }}/logs
         run: |
           chmod +x bin/orivon-ipfs-gateway
@@ -89,7 +94,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }}"
+            echo "### ${{ matrix.fetcher }} ${{ matrix.via }} ${{ matrix.routing }} broadcast ${{ matrix.broadcast }} tree ${{ matrix.tree || 'true' }} idles ${{ matrix.idles || 'default' }}"
             echo '```'
             grep -a '^LADDER' "$RUNNER_TEMP/ladder.txt" || true
             echo '```'
@@ -99,6 +104,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-${{ matrix.fetcher }}-${{ matrix.via }}-${{ matrix.routing }}-${{ matrix.broadcast }}
+          name: logs-${{ matrix.fetcher }}-${{ matrix.via }}-${{ matrix.routing }}-${{ matrix.broadcast }}-tree-${{ matrix.tree || 'true' }}-${{ matrix.idles && 'reordered' || 'default' }}
           path: ${{ runner.temp }}/logs
           if-no-files-found: ignore
