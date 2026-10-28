@@ -120,7 +120,8 @@ class Rig:
         return subprocess.run([self.args.ipfs, *argv], env=env, input=data, capture_output=True, timeout=timeout)
 
     def make_share(self, index):
-        site = os.path.join(self.tmp, f"site-{index}")
+        self.made = getattr(self, "made", 0) + 1
+        site = os.path.join(self.tmp, f"site-{self.made}")
         os.makedirs(site)
         with open(os.path.join(site, "index.html"), "w") as f:
             f.write(f"<h1>share {index} {secrets.token_hex(16)}</h1>\n")

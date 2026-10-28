@@ -9,6 +9,9 @@ on:
       args:
         description: Extra arguments for orivon/fresh-lookup-check.py
         default: ''
+      node_ref:
+        description: Build the node from this commit instead (the script stays the branch's)
+        default: ''
   push:
     branches: [fix/fresh-lookup]
 
@@ -33,6 +36,19 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Take the node's source from another commit
+        if: inputs.node_ref != ''
+        shell: bash
+        env:
+          NODE_REF: ${{ inputs.node_ref }}
+        run: |
+          git rm -r -q --cached crates vendor Cargo.toml Cargo.lock
+          rm -rf crates vendor Cargo.toml Cargo.lock
+          git checkout "$NODE_REF" -- crates vendor Cargo.toml Cargo.lock
+          git log -1 --oneline "$NODE_REF"
 
       - name: Stable Rust toolchain
         run: |
