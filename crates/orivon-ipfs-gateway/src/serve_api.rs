@@ -723,6 +723,146 @@ mod tests {
         assert_eq!(providing(&client, &base).await.len(), MAX_PROVIDED);
     }
 
+    /// Keeps a folder of `count` one-block files whose bytes end in `tag`, and returns the folder
+    /// and its files in the order the folder lists them.
+    fn keep_folder(kept: &KeptBlocks, tag: u8, count: u32) -> (cid::Cid, Vec<cid::Cid>) {
+        let files: Vec<Vec<u8>> = (0..count)
+            .map(|index| {
+                let mut data = index.to_be_bytes().to_vec();
+                data.push(tag);
+                data
+            })
+            .collect();
+        let cids: Vec<cid::Cid> = files.iter().map(|data| cid_from_data(CODEC_RAW, data)).collect();
+        let names: Vec<String> = (0..count).map(|index| format!("f{index}")).collect();
+        let entries: Vec<(&str, cid::Cid)> =
+            names.iter().map(String::as_str).zip(cids.iter().copied()).collect();
+        let (folder, folder_bytes) = folder_block(&entries);
+        let mut blocks: Vec<(cid::Cid, Vec<u8>)> = cids.iter().copied().zip(files).collect();
+        blocks.push((folder, folder_bytes));
+        kept.insert_all(blocks).unwrap();
+        (folder, cids)
+    }
+
+    #[tokio::test]
+    async fn a_new_root_is_announced_when_an_earlier_share_filled_the_table() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let (big, big_files) = keep_folder(&kept, 1, 2000);
+        let first = provide(&client, &base, &big.to_string()).await;
+        assert_eq!(first.status(), 202);
+        let body: serde_json::Value = first.json().await.unwrap();
+        assert_eq!(body["children"], MAX_PROVIDED - 1);
+        assert_eq!(body["truncated"], true);
+        let before = providing(&client, &base).await;
+        assert_eq!(before.len(), MAX_PROVIDED);
+
+        let single = raw_cid(b"a share of one file");
+        kept.insert_all(vec![(
+            cid_from_data(CODEC_RAW, b"a share of one file"),
+            b"a share of one file".to_vec(),
+        )])
+        .unwrap();
+        let second = provide(&client, &base, &single).await;
+        assert_eq!(second.status(), 202);
+        let body: serde_json::Value = second.json().await.unwrap();
+        assert_eq!(body["children"], 0);
+        assert_eq!(body["truncated"], false);
+
+        let after = providing(&client, &base).await;
+        assert_eq!(after.len(), MAX_PROVIDED);
+        assert!(after.contains(&single));
+        assert!(after.contains(&big.to_string()), "a root is never pushed out");
+        let members = MAX_PROVIDED - 1;
+        assert!(after.contains(&big_files[members - 2].to_string()));
+        assert!(
+            !after.contains(&big_files[members - 1].to_string()),
+            "the first share gave up its newest entry"
+        );
+
+        let again = provide(&client, &base, &big.to_string()).await;
+        assert_eq!(again.status(), 202);
+        let body: serde_json::Value = again.json().await.unwrap();
+        assert_eq!(body["children"], members - 1);
+        assert_eq!(body["truncated"], true);
+        assert_eq!(providing(&client, &base).await, after, "asking again takes no one's place");
+
+        let deleted = client
+            .delete(format!("{base}/provide/{single}"))
+            .header(KEY_HEADER, KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 200);
+        assert_eq!(
+            providing(&client, &base).await,
+            before,
+            "the place the second share gave up goes back to the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_that_just_fit_is_reported_cut_once_a_root_took_a_place() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let (folder, _) = keep_folder(&kept, 2, MAX_PROVIDED as u32 - 1);
+        let first = provide(&client, &base, &folder.to_string()).await;
+        let body: serde_json::Value = first.json().await.unwrap();
+        assert_eq!(body["children"], MAX_PROVIDED - 1);
+        assert_eq!(body["truncated"], false);
+
+        let single = raw_cid(b"one more share");
+        kept.insert_all(vec![(
+            cid_from_data(CODEC_RAW, b"one more share"),
+            b"one more share".to_vec(),
+        )])
+        .unwrap();
+        assert_eq!(provide(&client, &base, &single).await.status(), 202);
+
+        let again = provide(&client, &base, &folder.to_string()).await;
+        assert_eq!(again.status(), 202);
+        let body: serde_json::Value = again.json().await.unwrap();
+        assert_eq!(body["children"], MAX_PROVIDED - 2);
+        assert_eq!(body["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn named_roots_take_the_places_of_listed_entries_until_1024_are_named() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let (folder, _) = keep_folder(&kept, 3, 100);
+        let blocks: Vec<Vec<u8>> = (0..MAX_PROVIDED as u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        kept.insert_all(
+            blocks
+                .iter()
+                .map(|data| (cid_from_data(CODEC_RAW, data), data.clone()))
+                .collect(),
+        )
+        .unwrap();
+        let alone = MAX_PROVIDED - 24;
+        for data in &blocks[..alone] {
+            assert_eq!(provide(&client, &base, &raw_cid(data)).await.status(), 202);
+        }
+        let response = provide(&client, &base, &folder.to_string()).await;
+        assert_eq!(response.status(), 202);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["children"], 23, "the folder takes the room that is free");
+        assert_eq!(body["truncated"], true);
+
+        for data in &blocks[alone..MAX_PROVIDED - 1] {
+            assert_eq!(provide(&client, &base, &raw_cid(data)).await.status(), 202);
+        }
+        assert_eq!(providing(&client, &base).await.len(), MAX_PROVIDED);
+        let refused = provide(&client, &base, &raw_cid(&blocks[MAX_PROVIDED - 1])).await;
+        assert_eq!(refused.status(), 429, "all {MAX_PROVIDED} are named now");
+
+        let folder_again = provide(&client, &base, &folder.to_string()).await;
+        assert_eq!(folder_again.status(), 202);
+        let body: serde_json::Value = folder_again.json().await.unwrap();
+        assert_eq!(body["children"], 0, "every place it had went to a named CID");
+        assert_eq!(body["truncated"], true);
+    }
+
     #[tokio::test]
     async fn delete_provide_stops_a_cid_and_404s_when_it_was_not_provided() {
         let (base, kept) = serve_listening().await;
@@ -792,6 +932,7 @@ mod tests {
         }
         let last = raw_cid(&blocks[MAX_PROVIDED]);
         assert_eq!(provide(&client, &base, &last).await.status(), 429);
+        assert_eq!(providing(&client, &base).await.len(), MAX_PROVIDED);
         assert_eq!(provide(&client, &base, &raw_cid(&blocks[0])).await.status(), 202);
     }
 

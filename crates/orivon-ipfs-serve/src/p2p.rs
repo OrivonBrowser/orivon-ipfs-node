@@ -296,8 +296,13 @@ impl P2p {
         Ok((added.outcome, added.listed))
     }
 
-    pub(crate) fn unprovide(&mut self, swarm: &mut Swarm<Behaviour>, cid: &Cid) -> bool {
-        let removed = self.provided.remove(cid);
+    pub(crate) fn unprovide(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        cid: &Cid,
+        now: Instant,
+    ) -> bool {
+        let removed = self.provided.remove(cid, now);
         stop_providing(swarm, &removed.dropped);
         removed.was_named
     }
