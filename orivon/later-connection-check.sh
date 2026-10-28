@@ -31,7 +31,7 @@ IDLES=${IDLES:-"0 20 60 120"}
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-40}
 BROADCAST=${BROADCAST:-off}
 ROUTING=${ROUTING:-none}
-ANNOUNCE_WAIT=${ANNOUNCE_WAIT:-240}
+ANNOUNCE_WAIT=${ANNOUNCE_WAIT:-480}
 TREE=${TREE:-true}
 FILES=${FILES:-8}
 SCRATCH=${SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/later-connection.XXXXXX")}
@@ -176,6 +176,18 @@ kubo_ladder() {
     fi
   }
 
+  # PROBE_FROM..PROBE_TO: files the ladder does not ask for, looked up through the DHT one after
+  # the other, to see how many of the node's announcements a fresh Kubo can find.
+  if [ -n "${PROBE_TO:-}" ]; then
+    local found=0 total=0 n started count
+    for n in $(seq "${PROBE_FROM:-5}" "$PROBE_TO"); do
+      started=$(now)
+      count=$(timeout 60 "$IPFS" routing findprovs -n 1 --timeout 45s "${CHILD[f$n]}" 2>/dev/null | grep -c .)
+      total=$((total + 1)); [ "$count" -gt 0 ] && found=$((found + 1))
+      say "PROBE f$n providers_found=$count seconds=$(python3 -c "print(round($(now)-$started,1))")"
+    done
+    say "PROBE summary found=$found of $total"
+  fi
   connect
   cat_file first f0
   i=1
