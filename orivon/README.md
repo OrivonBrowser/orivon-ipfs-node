@@ -180,18 +180,30 @@ listener, and `/provide` not on one without a DHT):
 - `GET /health` adds `x-orivon-node-features: serve,listen,provide` (`serve,listen` on a node
   without a DHT), with `,relay` added at the end when `--relay` was accepted. A node without
   `--p2p-port` sends no such header.
-- `POST /provide`, body `{"cid":"<cid>"}`: 404 unless a block of that CID (same multihash) is kept;
-  else `202 {"cid":"<cid>"}`. The node announces it, when it is reachable, as a provider record keyed by
+- `POST /provide`, body `{"cid":"<cid>"}` or `{"cid":"<cid>","tree":false}`: 404 unless a block of that
+  CID (same multihash) is kept; else `202 {"cid":"<cid>","children":<n>,"truncated":<bool>}`. The node
+  announces it, when it is reachable, as a provider record keyed by
   the CID's multihash, as Kubo does (so a CIDv0 and a CIDv1 of one block are one entry), carrying the
   confirmed external addresses. It announces when the node first turns `public` or a relay accepts a
   reservation, whenever it turns `public` again or a relay accepts one again, when a new external
   address is confirmed, and every 12 hours after an announcement reached a peer. An announcement that
   reached no peer is tried again after a minute. It never announces while the node is not `public`
   and holds no relay reservation. Four announcements run at once. Providing the same CID
-  twice is one entry; a 1025th CID answers 429. Only the CIDs named are announced, so name the root
-  of a share: the peer that finds it fetches the rest of the DAG from the node over the connection.
-- `DELETE /provide/<cid>`: stops announcing and forgets it (`200 {"cid":"<cid>"}`), 404 when it was
-  not being provided. Records already published expire on their own (about 48 hours).
+  twice is one entry; a 1025th CID answers 429.
+  Unless `"tree"` is `false`, the kept blocks below the CID are announced with it: a UnixFS folder's
+  subfolders (and the shards of a large one) and the first block of each file in them, level by
+  level, `children` of them (a file's other blocks are not: the peer that finds the first fetches
+  them over the connection that answered). A peer that opens another file of the share later, on a
+  connection of its own, starts from that file's CID and asks the network who has it; with the root
+  alone announced the answer is nobody, and a fetcher that only offers wants to peers it found as
+  providers never asks this node. Announcing costs one DHT store per CID, four at a time, repeated
+  every 12 hours, so the table (1024 CIDs) bounds it: a share with more entries than fit is
+  announced breadth first as far as it fits and `truncated` says so. The root is always announced
+  first, and entries that do not fit are not fetched less reliably than before, only found by their
+  own CID less often. Blocks the node does not hold are skipped.
+- `DELETE /provide/<cid>`: stops announcing it and the entries it brought with it (`200
+  {"cid":"<cid>"}`), 404 when it was not being provided. An entry another root, or a call of its own,
+  also named stays. Records already published expire on their own (about 48 hours).
 - `GET /status`: `{"peer":"<peer id>","listen":[<multiaddr>,...],"external":[<multiaddr>,...],
   "relays":[<multiaddr>,...],"reachability":"public"|"private"|"unknown",
   "providing":[{"cid":"<cid>","announced":<unix ms>|null}]}`.
@@ -231,6 +243,14 @@ node's port closed by a firewall rule: AutoNAT says `private`, nothing is announ
 is found. The script skips parts 2 and 3, and says so, where namespaces are not available. The
 AutoNAT decisions are also tested in `crates/orivon-ipfs-serve/tests/provide.rs` against an
 in-process AutoNAT server.
+
+`orivon/later-connection-check.sh` checks the visitor who opens one file of a share, leaves, and
+asks for another after 0, 20, 60 and 120 seconds, over Orivon's circuit relay and directly. The
+fetcher is a scratch Kubo (with and without its Bitswap broadcast control, with and without the
+DHT) or a second copy of the node (`FETCHER=node`, with a small routing service that names the node
+as provider of what it reports as provided). Every step must find its file. The Bitswap side is
+also tested in process, over a relay and directly, in
+`crates/orivon-ipfs-serve/tests/later_connection.rs`.
 
 ## Partitions
 

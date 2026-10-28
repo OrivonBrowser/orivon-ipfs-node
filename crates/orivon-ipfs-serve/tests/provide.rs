@@ -4,9 +4,10 @@
 
 mod support;
 
-use orivon_ipfs_core::{cid_from_data, CODEC_RAW};
+use orivon_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
 use orivon_ipfs_serve::{
-    AddOutcome, KeptBlocks, NodeStatus, P2pConfig, ProvideError, Reachability, ServeNode,
+    announce_set, AddOutcome, KeptBlocks, NodeStatus, P2pConfig, ProvideError, Reachability,
+    ServeNode, MAX_PROVIDED,
 };
 use futures::StreamExt;
 use libp2p::kad::store::{MemoryStore, RecordStore};
@@ -359,4 +360,71 @@ async fn a_node_that_cannot_reach_its_relay_announces_nothing() {
     assert!(status.relays.is_empty());
     assert_eq!(status.providing[0].announced, None);
     assert_eq!(server.announcements().await, 0);
+}
+
+/// A UnixFS directory block whose entries are `links`, encoded by hand: field 1 of the node is the
+/// UnixFS data (type 1, a directory), field 2 repeats one link per entry.
+fn folder_block(links: &[cid::Cid]) -> (cid::Cid, Vec<u8>) {
+    let mut node = vec![0x0a, 0x02, 0x08, 0x01];
+    for link in links {
+        let hash = link.to_bytes();
+        node.extend([0x12, (hash.len() + 2) as u8, 0x0a, hash.len() as u8]);
+        node.extend(hash);
+    }
+    (cid_from_data(CODEC_DAG_PB, &node), node)
+}
+
+/// A visitor opening another file of a share later looks for providers of that file's own CID:
+/// announcing the root alone leaves it nothing to find.
+#[tokio::test]
+async fn every_file_of_a_provided_folder_is_announced_through_the_relay_and_withdrawn_with_it() {
+    let server = Server::start(false).await;
+    let relay = start_relay().await;
+    let files: Vec<(cid::Cid, Vec<u8>)> = (0..3)
+        .map(|index| {
+            let data = format!("file number {index}").into_bytes();
+            (cid_from_data(CODEC_RAW, &data), data)
+        })
+        .collect();
+    let names: Vec<cid::Cid> = files.iter().map(|file| file.0).collect();
+    let (root, root_data) = folder_block(&names);
+    let kept = KeptBlocks::default();
+    kept.insert_all(files.iter().cloned().chain([(root, root_data)]).collect())
+        .unwrap();
+    let config = P2pConfig::new(free_port())
+        .with_dht(vec![server.bootstrap()])
+        .with_relays(vec![relay.bootstrap()]);
+    let node = ServeNode::start_with_p2p(kept.clone(), true, Some(config))
+        .await
+        .unwrap();
+
+    let (set, cut) = announce_set(&kept, &root, MAX_PROVIDED);
+    assert!(!cut);
+    assert_eq!(set[0], root);
+    assert_eq!(
+        node.provide_tree(root, set[1..].to_vec()).await,
+        Ok((AddOutcome::Added, 3))
+    );
+
+    let status = status_where(&node, "all four announced", |s| {
+        s.providing.len() == 4 && s.providing.iter().all(|entry| entry.announced.is_some())
+    })
+    .await;
+    let circuit = status.relays[0].to_string();
+    for cid in std::iter::once(root).chain(names.iter().copied()) {
+        let records = server.providers(cid.hash().to_bytes()).await;
+        assert_eq!(records.len(), 1, "no provider record for {cid}");
+        assert_eq!(records[0].provider, node.peer_id());
+        assert!(
+            records[0]
+                .addresses
+                .iter()
+                .any(|addr| addr.to_string().starts_with(&circuit)),
+            "{circuit} not in {:?}",
+            records[0].addresses
+        );
+    }
+
+    assert_eq!(node.unprovide(root).await, Ok(true));
+    assert!(node.status().await.unwrap().providing.is_empty());
 }

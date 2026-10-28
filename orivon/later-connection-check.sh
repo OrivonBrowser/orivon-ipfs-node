@@ -115,10 +115,11 @@ fi
 
 kubo_ladder() {
   export IPFS_PATH="$SCRATCH/f"
-  "$IPFS" init --profile=test >/dev/null 2>&1 || { say "ipfs init failed"; exit 2; }
   if [ "$ROUTING" = dht ]; then
+    "$IPFS" init >/dev/null 2>&1 || { say "ipfs init failed"; exit 2; }
     "$IPFS" config --json Routing.Type '"dhtclient"' >/dev/null 2>&1
   else
+    "$IPFS" init --profile=test >/dev/null 2>&1 || { say "ipfs init failed"; exit 2; }
     "$IPFS" bootstrap rm --all >/dev/null 2>&1
     "$IPFS" config --json Routing.Type '"none"' >/dev/null 2>&1
     "$IPFS" config --json AutoConf.Enabled false >/dev/null 2>&1
