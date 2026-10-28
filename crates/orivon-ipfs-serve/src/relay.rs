@@ -124,16 +124,6 @@ impl Relays {
         }
     }
 
-    /// True when `peer` is a relay the node asks for a reservation.
-    pub(crate) fn is_relay(&self, peer: &PeerId) -> bool {
-        self.entries.iter().any(|relay| {
-            relay
-                .listen
-                .iter()
-                .any(|part| matches!(part, Protocol::P2p(id) if &id == peer))
-        })
-    }
-
     /// True while at least one relay holds a reservation.
     pub(crate) fn active(&self) -> bool {
         self.entries.iter().any(|relay| !relay.held.is_empty())
