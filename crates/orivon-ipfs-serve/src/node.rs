@@ -884,6 +884,64 @@ mod tests {
         parse_dial_addr(&format!("/{host_and_port}/p2p/{PEER}"), allow_local)
     }
 
+    /// An announcement walks the DHT through dozens of peers and the connections it opens count
+    /// against the outbound limit; one the walk is refused hands its record to peers far from the key.
+    #[cfg(not(target_os = "wasi"))]
+    #[tokio::test]
+    async fn the_swarm_holds_as_many_dialed_connections_as_a_dht_walk_keeps_open() {
+        const PEERS: usize = 48;
+        let mut addrs = Vec::new();
+        for _ in 0..PEERS {
+            let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+                .with_tokio()
+                .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+                .unwrap()
+                .with_behaviour(|_| ping::Behaviour::default())
+                .unwrap()
+                .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build();
+            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            let listening = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    break address;
+                }
+            };
+            addrs.push(listening.with(Protocol::P2p(*swarm.local_peer_id())));
+            tokio::spawn(async move {
+                loop {
+                    swarm.select_next_some().await;
+                }
+            });
+        }
+
+        let keypair = Keypair::generate_ed25519();
+        let mut swarm = build_swarm(&keypair, true, Some(&P2pConfig::new(0)), false)
+            .await
+            .unwrap();
+        let mut established = 0;
+        // In batches: the swarm also limits the dials in progress.
+        for batch in addrs.chunks(16) {
+            for addr in batch {
+                swarm.dial(addr.clone()).unwrap();
+            }
+            let wanted = established + batch.len();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while established < wanted {
+                    if let SwarmEvent::ConnectionEstablished { endpoint, .. } =
+                        swarm.select_next_some().await
+                    {
+                        if endpoint.is_dialer() {
+                            established += 1;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("only {established} of {wanted} dialed connections opened"));
+        }
+        assert_eq!(established, PEERS);
+    }
+
     #[test]
     fn accepts_public_tcp_addresses_with_a_peer_id() {
         for host in [
