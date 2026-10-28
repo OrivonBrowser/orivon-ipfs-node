@@ -2,6 +2,11 @@
 //!
 //! Nothing here touches the network: [`Provided`] says which CIDs to announce now, and the node
 //! reports back how each announcement went.
+//!
+//! Which CID goes first when more are due than there are places is decided in
+//! [`Provided::take_due`]: a root no announcement has reached comes first, then the folders and
+//! files of the shares, each share in turn, and one place in [`FIRSTS_PER_RENEWAL`] + 1 goes to a
+//! renewal while both wait.
 
 use cid::Cid;
 use std::collections::{HashMap, HashSet};
@@ -17,6 +22,9 @@ pub const REANNOUNCE_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
 pub const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Announcements running at once.
 pub const MAX_ANNOUNCING: usize = 4;
+/// While a renewal and a first announcement are both due, this many first announcements are taken
+/// before the next place goes to the renewal.
+pub const FIRSTS_PER_RENEWAL: u32 = 4;
 
 /// Whether other peers can open connections to this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,12 +76,22 @@ struct Entry {
     order: u64,
 }
 
+impl Entry {
+    /// Waiting for a place, as opposed to running or not due yet.
+    fn is_due(&self, now: Instant) -> bool {
+        !self.announcing && self.due <= now
+    }
+}
+
 /// What one root asked to have announced with it, and how much of that the table holds.
 struct Tree {
     /// The members the last call listed, breadth first, without the root or repeats.
     wanted: Vec<Cid>,
     /// The keys of the members of `wanted` the table lists under this root now.
     listed: HashSet<Vec<u8>>,
+    /// The turn at which a member of this tree was last given a place, 0 for none yet. The tree
+    /// served longest ago goes next.
+    served: u64,
 }
 
 impl Tree {
@@ -114,6 +132,10 @@ pub struct Provided {
     /// For each root given to [`Provided::add_tree`], what it asked for and what the table lists.
     trees: HashMap<Vec<u8>, Tree>,
     next_order: u64,
+    /// Counts the places given to a member of a tree, to say which tree was served longest ago.
+    turn: u64,
+    /// First announcements taken since a renewal last had a place, counted while a renewal waited.
+    firsts_since_renewal: u32,
     reachability: Reachability,
     /// A relay holds a reservation for the node, so peers can reach it through the relay whatever
     /// AutoNAT says about a direct connection.
@@ -132,6 +154,8 @@ impl Provided {
             entries: HashMap::new(),
             trees: HashMap::new(),
             next_order: 0,
+            turn: 0,
+            firsts_since_renewal: 0,
             reachability: Reachability::Unknown,
             relayed: false,
             reannounce_every,
@@ -173,7 +197,8 @@ impl Provided {
     /// Names `root` like `name` and lists `members` under it: they are announced for as
     /// long as the root is, however many roots list the same one. A member takes only room that is
     /// free: one that does not fit is left out, never the root, which pushes a listed CID of
-    /// another root out when the table is full. Giving the same root again replaces its list.
+    /// another root out when the table is full. Giving the same root again replaces its list and
+    /// keeps its place in the turns.
     pub fn add_tree(
         &mut self,
         root: Cid,
@@ -184,6 +209,7 @@ impl Provided {
         let outcome = self.name(root, now, &mut dropped)?;
         let root_key = provider_key(&root);
         let previous = self.trees.remove(&root_key);
+        let served = previous.as_ref().map_or(0, |tree| tree.served);
         let mut seen = HashSet::from([root_key.clone()]);
         let mut wanted = Vec::new();
         let mut listed = HashSet::new();
@@ -205,7 +231,14 @@ impl Provided {
         for key in previous.iter().flat_map(|tree| tree.listed.iter()) {
             dropped.extend(self.unlist(key));
         }
-        self.trees.insert(root_key.clone(), Tree { wanted, listed });
+        self.trees.insert(
+            root_key.clone(),
+            Tree {
+                wanted,
+                listed,
+                served,
+            },
+        );
         self.top_up(now);
         // A CID pushed out and listed again by the same call is still announced.
         dropped.retain(|cid| !self.entries.contains_key(&provider_key(cid)));
@@ -392,23 +425,109 @@ impl Provided {
     /// The CIDs to announce now, at most `room` of them, none unless the node is public or a relay
     /// holds a reservation for it. Each is marked as running until [`Provided::announced`] or
     /// [`Provided::failed`] says how it went.
+    ///
+    /// A place goes to the first of these that has something due:
+    ///
+    /// 1. A CID named by a call that no announcement has reached, the earliest call first. A new
+    ///    root is therefore announced as soon as a place frees, whatever else waits.
+    /// 2. A CID that is only listed under a root and that no announcement has reached: the trees
+    ///    take turns, the one given a place longest ago first (the older root when level), and a
+    ///    tree gives the member that has been due longest. A share made after a big one joins the
+    ///    turns at once.
+    /// 3. A CID an announcement reached before, now due again, the one due longest first.
+    ///
+    /// While something under 1 or 2 and something under 3 are both due, one place in
+    /// [`FIRSTS_PER_RENEWAL`] + 1 goes to the renewal: renewals do not wait for the first
+    /// announcements to finish, and do not hold them back.
     pub fn take_due(&mut self, now: Instant, room: usize) -> Vec<Cid> {
-        if !self.announceable() || room == 0 {
+        if !self.announceable() {
             return Vec::new();
         }
-        let mut due: Vec<&mut Entry> = self
-            .entries
-            .values_mut()
-            .filter(|entry| !entry.announcing && entry.due <= now)
-            .collect();
-        due.sort_by_key(|entry| (entry.due, entry.order));
-        due.into_iter()
-            .take(room)
-            .map(|entry| {
+        let mut taken = Vec::new();
+        while taken.len() < room {
+            let Some(key) = self.next_due(now) else {
+                break;
+            };
+            if let Some(entry) = self.entries.get_mut(&key) {
                 entry.announcing = true;
-                entry.cid
+                taken.push(entry.cid);
+            }
+        }
+        taken
+    }
+
+    /// The key of the CID the next free place goes to. Giving it the place is recorded: in the
+    /// turns of its tree, and in the count that gives a renewal its place.
+    fn next_due(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let first = self.next_first(now);
+        let renewal = self.next_renewal(now);
+        match (first, renewal) {
+            (Some((key, tree)), Some(renewal)) => {
+                if self.firsts_since_renewal >= FIRSTS_PER_RENEWAL {
+                    self.firsts_since_renewal = 0;
+                    Some(renewal)
+                } else {
+                    self.firsts_since_renewal += 1;
+                    self.serve(tree);
+                    Some(key)
+                }
+            }
+            (Some((key, tree)), None) => {
+                self.serve(tree);
+                Some(key)
+            }
+            (None, renewal) => {
+                self.firsts_since_renewal = 0;
+                renewal
+            }
+        }
+    }
+
+    /// Records that the tree under `root`, if any, was given a place now.
+    fn serve(&mut self, root: Option<Vec<u8>>) {
+        let Some(tree) = root.and_then(|root| self.trees.get_mut(&root)) else {
+            return;
+        };
+        self.turn += 1;
+        tree.served = self.turn;
+    }
+
+    /// The CID a first announcement goes to, and the root of the tree it is a member of when it is
+    /// not named itself. A named CID comes before any member; members come tree by tree.
+    fn next_first(&self, now: Instant) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let named = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.named && entry.announced.is_none() && entry.is_due(now))
+            .min_by_key(|(_, entry)| (entry.due, entry.order))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = named {
+            return Some((key, None));
+        }
+        self.trees
+            .iter()
+            .filter_map(|(root, tree)| {
+                let (key, _) = tree
+                    .listed
+                    .iter()
+                    .filter_map(|key| self.entries.get(key).map(|entry| (key, entry)))
+                    .filter(|(_, entry)| {
+                        !entry.named && entry.announced.is_none() && entry.is_due(now)
+                    })
+                    .min_by_key(|(_, entry)| (entry.due, entry.order))?;
+                Some(((tree.served, self.order_of(root)), key, root))
             })
-            .collect()
+            .min_by_key(|(rank, _, _)| *rank)
+            .map(|(_, key, root)| (key.clone(), Some(root.clone())))
+    }
+
+    /// The CID an earlier announcement reached that is due again the longest.
+    fn next_renewal(&self, now: Instant) -> Option<Vec<u8>> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.announced.is_some() && entry.is_due(now))
+            .min_by_key(|(_, entry)| (entry.due, entry.order))
+            .map(|(key, _)| key.clone())
     }
 
     pub fn announcing(&self) -> usize {
@@ -960,5 +1079,201 @@ mod tests {
         assert_eq!(smaller.dropped, vec![a[2]]);
         assert!(holds(&provided, &b[0]));
         assert_eq!(provided.snapshot().len(), 5);
+    }
+
+    fn numbered(prefix: &str, count: usize) -> Vec<Cid> {
+        (0..count)
+            .map(|index| cid(format!("{prefix} {index}").as_bytes()))
+            .collect()
+    }
+
+    /// Takes one place at a time and reports it reached, as a node does when each announcement
+    /// ends before the next place frees.
+    fn drain(provided: &mut Provided, now: Instant, places: usize) -> Vec<Cid> {
+        let mut order = Vec::new();
+        for _ in 0..places {
+            let Some(next) = provided.take_due(now, 1).first().copied() else {
+                break;
+            };
+            provided.announced(&next, now, 1);
+            order.push(next);
+        }
+        order
+    }
+
+    #[test]
+    fn a_new_root_is_announced_ahead_of_a_backlog_of_a_thousand() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let backlog = numbered("backlog", 1000);
+        let backlog_root = cid(b"backlog root");
+        provided.add_tree(backlog_root, &backlog, now).unwrap();
+        assert_eq!(drain(&mut provided, now, 1), vec![backlog_root]);
+        assert_eq!(drain(&mut provided, now, 3), backlog[..3].to_vec());
+
+        let later = now + Duration::from_secs(5);
+        let (small_root, small_file) = (cid(b"small root"), cid(b"small file"));
+        provided.add_tree(small_root, &[small_file], later).unwrap();
+        assert_eq!(provided.take_due(later, 1), vec![small_root]);
+        provided.announced(&small_root, later, 1);
+        assert_eq!(
+            provided.take_due(later, 1),
+            vec![small_file],
+            "its file takes the next turn, not the thousand's"
+        );
+    }
+
+    #[test]
+    fn roots_are_announced_in_the_order_they_were_given_before_any_member() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let roots = numbered("root", 3);
+        for (index, root) in roots.iter().enumerate() {
+            let members = numbered(&format!("member of {index}"), 5);
+            provided.add_tree(*root, &members, now).unwrap();
+        }
+        assert_eq!(provided.take_due(now, 3), roots);
+    }
+
+    #[test]
+    fn a_small_share_made_after_a_big_one_is_announced_while_the_big_one_still_waits() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let big = numbered("big", 500);
+        let small = numbered("small", 10);
+        let (big_root, small_root) = (cid(b"big root"), cid(b"small root"));
+        provided.add_tree(big_root, &big, now).unwrap();
+        assert_eq!(drain(&mut provided, now, 51).len(), 51);
+
+        let later = now + Duration::from_secs(5);
+        provided.add_tree(small_root, &small, later).unwrap();
+        let order = drain(&mut provided, later, 21);
+        assert_eq!(order[0], small_root);
+        assert!(small.iter().all(|file| order.contains(file)));
+        let from_big = order.iter().filter(|cid| big.contains(cid)).count();
+        assert_eq!(from_big, 10, "the big share keeps every other place");
+    }
+
+    #[test]
+    fn trees_take_turns_one_entry_each() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let trees: Vec<Vec<Cid>> = (0..3)
+            .map(|index| numbered(&format!("tree {index}"), 20))
+            .collect();
+        let roots = numbered("root", 3);
+        for (root, members) in roots.iter().zip(&trees) {
+            provided.add_tree(*root, members, now).unwrap();
+        }
+        assert_eq!(drain(&mut provided, now, 3), roots);
+
+        let order = drain(&mut provided, now, 30);
+        let turns: Vec<usize> = order
+            .iter()
+            .map(|cid| trees.iter().position(|tree| tree.contains(cid)).unwrap())
+            .collect();
+        let expected: Vec<usize> = (0..30).map(|index| index % 3).collect();
+        assert_eq!(turns, expected);
+    }
+
+    #[test]
+    fn giving_a_root_again_does_not_move_it_up_the_turns() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let (a, b) = (numbered("a", 10), numbered("b", 10));
+        let (root_a, root_b) = (cid(b"root a"), cid(b"root b"));
+        provided.add_tree(root_a, &a, now).unwrap();
+        provided.add_tree(root_b, &b, now).unwrap();
+        assert_eq!(drain(&mut provided, now, 2), vec![root_a, root_b]);
+        assert_eq!(drain(&mut provided, now, 3), vec![a[0], b[0], a[1]]);
+        provided.add_tree(root_a, &a, now).unwrap();
+        assert_eq!(drain(&mut provided, now, 2), vec![b[1], a[2]]);
+    }
+
+    #[test]
+    fn one_place_in_five_goes_to_a_renewal_while_first_announcements_wait() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let old = numbered("old", 6);
+        for cid in &old {
+            provided.add(*cid, now).unwrap();
+        }
+        assert_eq!(drain(&mut provided, now, 6).len(), 6);
+
+        let later = now + REANNOUNCE_EVERY;
+        let root = cid(b"new root");
+        let members = numbered("new", 40);
+        provided.add_tree(root, &members, later).unwrap();
+        let order = provided.take_due(later, 15);
+        let renewals: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, cid)| old.contains(cid))
+            .map(|(place, _)| place)
+            .collect();
+        assert_eq!(renewals, vec![4, 9, 14]);
+        assert_eq!(order[..4].to_vec(), [vec![root], members[..3].to_vec()].concat());
+        assert_eq!(order[5..9].to_vec(), members[3..7].to_vec());
+    }
+
+    #[test]
+    fn a_flood_of_renewals_does_not_hold_back_a_new_share() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let old = numbered("old", 1000);
+        for cid in &old {
+            provided.add(*cid, now).unwrap();
+        }
+        assert_eq!(provided.take_due(now, 1000).len(), 1000);
+        for cid in &old {
+            provided.announced(cid, now, 1);
+        }
+        let later = now + Duration::from_secs(30);
+        provided.address_added(later);
+
+        let root = cid(b"new root");
+        let members = numbered("new", 3);
+        provided.add_tree(root, &members, later).unwrap();
+        let order = provided.take_due(later, 6);
+        assert_eq!(order[..4].to_vec(), [vec![root], members.clone()].concat());
+        assert!(order[4..].iter().all(|cid| old.contains(cid)));
+    }
+
+    #[test]
+    fn a_backlog_of_first_announcements_does_not_stop_renewals() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let old = numbered("old", 20);
+        for cid in &old {
+            provided.add(*cid, now).unwrap();
+        }
+        assert_eq!(drain(&mut provided, now, 20).len(), 20);
+
+        let later = now + REANNOUNCE_EVERY;
+        provided
+            .add_tree(cid(b"big root"), &numbered("big", 1000), later)
+            .unwrap();
+        let order = provided.take_due(later, 100);
+        let renewals: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, cid)| old.contains(cid))
+            .map(|(place, _)| place)
+            .collect();
+        let every_fifth: Vec<usize> = (1..=20).map(|nth| nth * 5 - 1).collect();
+        assert_eq!(renewals, every_fifth);
+    }
+
+    #[test]
+    fn renewals_take_every_place_when_no_first_announcement_waits() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let old = numbered("old", 7);
+        for cid in &old {
+            provided.add(*cid, now).unwrap();
+        }
+        assert_eq!(drain(&mut provided, now, 7), old);
+        let later = now + REANNOUNCE_EVERY;
+        assert_eq!(provided.take_due(later, 10), old);
     }
 }
