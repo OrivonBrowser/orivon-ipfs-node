@@ -189,7 +189,7 @@ listener, and `/provide` not on one without a DHT):
   address is confirmed, and every 12 hours after an announcement reached a peer. An announcement that
   reached no peer is tried again after a minute. It never announces while the node is not `public`
   and holds no relay reservation. Four announcements run at once. Providing the same CID
-  twice is one entry; a 1025th CID answers 429.
+  twice is one entry.
   Unless `"tree"` is `false`, the kept blocks below the CID are announced with it: a UnixFS folder's
   subfolders (and the shards of a large one) and the first block of each file in them, level by
   level, `children` of them (a file's other blocks are not: the peer that finds the first fetches
@@ -197,16 +197,31 @@ listener, and `/provide` not on one without a DHT):
   connection of its own, starts from that file's CID and asks the network who has it; with the root
   alone announced the answer is nobody, and a fetcher that only offers wants to peers it found as
   providers never asks this node. Announcing costs one DHT store per CID, four at a time, repeated
-  every 12 hours, so the table (1024 CIDs) bounds it: a share with more entries than fit is
-  announced breadth first as far as it fits and `truncated` says so. The root is always announced
-  first, and entries that do not fit are not fetched less reliably than before, only found by their
-  own CID less often. Blocks the node does not hold are skipped.
+  every 12 hours, so the table bounds it. Blocks the node does not hold are skipped.
+  **The table.** It holds 1024 CIDs and belongs to the whole node: every root shares it. A CID is in
+  it because a call named it (a root, or a CID given with `"tree":false`) or because a root lists it.
+  Named CIDs have the first claim: while fewer than 1024 are named, a new root always gets a place,
+  and the 1025th named CID answers 429. When the table is full, the new root pushes out CIDs that
+  are only listed and never a named one: from the root that lists the most (the newer of two level
+  roots), that root's newest entries first, so its deepest levels go first. A pushed-out CID stops
+  being announced, and the root it was listed under is cut short. A share that does not fit is
+  announced breadth first as far as it does, and `truncated` says so: `children` is what the table
+  lists under the root, and a call for the same root while the table has no room answers with that
+  count and `truncated: true`. The members of a new root take only places that are free, so a
+  share that arrives at a full table is announced as its root alone. A call for a root that is
+  already named takes no one's place. When a `DELETE /provide/<cid>` frees places, they go back to
+  the roots that were cut, the one listing the fewest members first (the older of two level roots),
+  each in its breadth-first order. The root is always announced first. An entry that is not
+  announced is fetched as reliably as any other once a peer has found the root, and is only found
+  by its own CID less often.
 - `DELETE /provide/<cid>`: stops announcing it and the entries it brought with it (`200
   {"cid":"<cid>"}`), 404 when it was not being provided. An entry another root, or a call of its own,
   also named stays. Records already published expire on their own (about 48 hours).
 - `GET /status`: `{"peer":"<peer id>","listen":[<multiaddr>,...],"external":[<multiaddr>,...],
   "relays":[<multiaddr>,...],"reachability":"public"|"private"|"unknown",
-  "providing":[{"cid":"<cid>","announced":<unix ms>|null}]}`.
+  "providing":[{"cid":"<cid>","announced":<unix ms>|null}]}`. `providing` lists every CID the
+  table holds, roots and listed entries alike (see "The table" above); one that was pushed out is not
+  in it.
   `listen` is what the swarm reports (one address per network interface; the wildcard addresses when
   the build cannot list interfaces, as the WebAssembly build cannot). Addresses carry no `/p2p/` suffix.
   `external` is the confirmed addresses. `relays` is the circuit addresses a relay holds a reservation
@@ -217,7 +232,8 @@ listener, and `/provide` not on one without a DHT):
 
 **Bounds**, on top of every bound above: at most 64 established inbound connections, 4 per peer
 (either direction), 32 inbound connections still being set up, 128 established connections the node
-opened (peers it keeps, the DHT, AutoNAT servers), 1024 provided CIDs. A connection with no open
+opened (peers it keeps, the DHT, AutoNAT servers), 1024 provided CIDs for all roots together (named
+CIDs first; a root's listed entries fill what they leave, see "The table"). A connection with no open
 stream closes after 60 seconds, except those to the peers a page asked the node to keep. In this mode
 the node also dials public IP addresses only (names are resolved first), whoever names the address, so
 a DHT peer cannot send it to the local network; `--allow-local-dial` lifts that too.

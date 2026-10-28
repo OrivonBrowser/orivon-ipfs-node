@@ -228,7 +228,9 @@ impl ServeNode {
     }
 
     /// Announces `cid` and, until `cid` is stopped, `members` with it (the entries of a folder, say).
-    /// Members beyond the limit on announced CIDs are left out; the count that fit comes back.
+    /// A member takes only a place that is free and is left out otherwise; the count that fit comes
+    /// back. `cid` itself always gets a place unless the limit on announced CIDs is all named ones:
+    /// a CID that is only listed under another root gives way.
     pub async fn provide_tree(
         &self,
         cid: Cid,
@@ -599,7 +601,7 @@ async fn run<S>(
                     }
                     Command::Unprovide { cid, respond } => {
                         let _ = respond.send(match p2p.as_mut() {
-                            Some(p2p) => Ok(p2p.unprovide(&mut swarm, &cid)),
+                            Some(p2p) => Ok(p2p.unprovide(&mut swarm, &cid, Instant::now())),
                             None => Err(ProvideError::NotEnabled),
                         });
                         continue;
