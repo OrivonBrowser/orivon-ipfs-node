@@ -19,6 +19,9 @@ permissions:
   contents: read
 
 env:
+  # Git Bash on Windows would turn an argument that starts with / into a path.
+  MSYS_NO_PATHCONV: '1'
+  MSYS2_ARG_CONV_EXCL: '*'
   RELAY: /ip4/152.228.138.30/tcp/4003/p2p/12D3KooWReTq9frXSU18aXYvksPBQRWj9qafTSB4gxgUg6QqqnqJ
 
 jobs:
