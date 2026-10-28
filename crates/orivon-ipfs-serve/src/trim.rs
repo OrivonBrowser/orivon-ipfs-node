@@ -13,11 +13,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 /// More outbound connections than this and the oldest ones are closed.
-pub(crate) const HIGH_WATER: usize = 48;
+pub(crate) const HIGH_WATER: usize = 56;
 /// The count the closing stops at.
 pub(crate) const LOW_WATER: usize = 32;
-/// A connection younger than this stays: its request may not have been answered yet.
-pub(crate) const MIN_AGE: Duration = Duration::from_secs(3);
+/// A connection younger than this stays: its request may not have been answered yet. A walk opens
+/// dozens of connections a second, so a longer wait lets the count reach the limit anyway.
+pub(crate) const MIN_AGE: Duration = Duration::from_secs(1);
 
 /// The connections this node dialed, and when each was established.
 #[derive(Default)]

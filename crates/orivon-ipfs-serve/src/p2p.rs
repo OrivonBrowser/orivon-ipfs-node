@@ -31,9 +31,12 @@ pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
 pub const MAX_PENDING_INBOUND: u32 = 32;
 /// Established connections this node opened: the peers it keeps, the DHT, the AutoNAT servers.
 /// [`Trimmer`] closes the oldest well before this is reached, so a dial is never refused for it.
-pub const MAX_OUTBOUND_CONNECTIONS: u32 = 64;
+pub const MAX_OUTBOUND_CONNECTIONS: u32 = 96;
 /// A connection with no open stream closes after this, unless its peer is one the node keeps.
 pub(crate) const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Announcements walking the DHT at once. A walk dials a hundred peers and keeps the ones that
+/// answer, so more walks than this open connections faster than they close.
+const MAX_WALKS: usize = 2;
 pub(crate) const KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const KAD_BOOTSTRAP_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Peers that serve AutoNAT v1, remembered so a probe has someone to ask after the connections
@@ -540,7 +543,9 @@ impl P2p {
         if !self.dht {
             return;
         }
-        let room = MAX_ANNOUNCING.saturating_sub(self.provided.announcing());
+        let room = MAX_ANNOUNCING
+            .min(MAX_WALKS)
+            .saturating_sub(self.provided.announcing());
         for cid in self.provided.take_due(now, room) {
             let started = swarm
                 .behaviour_mut()
