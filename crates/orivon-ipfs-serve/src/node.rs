@@ -111,7 +111,8 @@ enum Command {
     Dial(DialCommand),
     Provide {
         cid: Cid,
-        respond: oneshot::Sender<Result<AddOutcome, ProvideError>>,
+        members: Vec<Cid>,
+        respond: oneshot::Sender<Result<(AddOutcome, usize), ProvideError>>,
     },
     Unprovide {
         cid: Cid,
@@ -221,7 +222,24 @@ impl ServeNode {
 
     /// Announces `cid` on the DHT whenever the node is reachable, and again every 12 hours.
     pub async fn provide(&self, cid: Cid) -> Result<AddOutcome, ProvideError> {
-        self.ask(|respond| Command::Provide { cid, respond }).await
+        self.provide_tree(cid, Vec::new())
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Announces `cid` and, until `cid` is stopped, `members` with it (the entries of a folder, say).
+    /// Members beyond the limit on announced CIDs are left out; the count that fit comes back.
+    pub async fn provide_tree(
+        &self,
+        cid: Cid,
+        members: Vec<Cid>,
+    ) -> Result<(AddOutcome, usize), ProvideError> {
+        self.ask(|respond| Command::Provide {
+            cid,
+            members,
+            respond,
+        })
+        .await
     }
 
     /// Stops announcing `cid`; false when it was not being announced.
@@ -572,9 +590,9 @@ async fn run<S>(
                 let Some(command) = command else { return };
                 let DialCommand { addr, peer, respond } = match command {
                     Command::Dial(dial) => dial,
-                    Command::Provide { cid, respond } => {
+                    Command::Provide { cid, members, respond } => {
                         let _ = respond.send(match p2p.as_mut() {
-                            Some(p2p) => p2p.provide(cid, Instant::now()),
+                            Some(p2p) => p2p.provide(&mut swarm, cid, &members, Instant::now()),
                             None => Err(ProvideError::NotEnabled),
                         });
                         continue;
@@ -634,6 +652,7 @@ async fn run<S>(
                 if let Some(p2p) = p2p.as_mut() {
                     p2p.on_event(&mut swarm, &event, Instant::now());
                 }
+                log_connection_event(&event);
                 match event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     let now = Instant::now();
@@ -675,6 +694,7 @@ async fn run<S>(
                 }
             }
             Some((version, peer, stream)) = incoming.next() => {
+                tracing::debug!(%peer, protocol = %version.protocol(), "inbound bitswap stream");
                 match limits.try_acquire(peer) {
                     Some(permit) => {
                         tokio::spawn(serve_stream(
@@ -725,6 +745,43 @@ async fn run<S>(
     }
 }
 
+/// What a peer's connections did, for a debug log: which connection, over which address, and why
+/// it closed.
+fn log_connection_event(event: &SwarmEvent<BehaviourEvent>) {
+    match event {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id,
+            endpoint,
+            num_established,
+            ..
+        } => tracing::debug!(
+            %peer_id,
+            connection = ?connection_id,
+            address = %endpoint.get_remote_address(),
+            dialer = endpoint.is_dialer(),
+            established = num_established.get(),
+            "connection established"
+        ),
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id,
+            endpoint,
+            num_established,
+            cause,
+            ..
+        } => tracing::debug!(
+            %peer_id,
+            connection = ?connection_id,
+            address = %endpoint.get_remote_address(),
+            remaining = *num_established,
+            cause = ?cause,
+            "connection closed"
+        ),
+        _ => {}
+    }
+}
+
 /// Asks the swarm to hold the connections to `peer` open (or to let them close when idle).
 fn keep_open(swarm: &mut libp2p::Swarm<Behaviour>, peer: PeerId, keep: bool) {
     if let Some(keepalive) = swarm.behaviour_mut().keepalive.as_mut() {
@@ -743,12 +800,30 @@ async fn serve_stream(
     loop {
         let message = match timeout(STREAM_IDLE_TIMEOUT, read_message(&mut stream)).await {
             Ok(Ok(Some(message))) => message,
-            _ => break,
+            Ok(Ok(None)) => {
+                tracing::debug!(%peer, "bitswap stream ended");
+                break;
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(%peer, %err, "bitswap stream failed");
+                break;
+            }
+            Err(_) => {
+                tracing::debug!(%peer, "bitswap stream idle");
+                break;
+            }
         };
         let replies = reply_to_wantlist(&message, &kept, version);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let entries = message.wantlist.as_ref().map_or(0, |list| list.entries.len());
+            let blocks: usize = replies.iter().map(|reply| reply.payload.len() + reply.blocks.len()).sum();
+            let presences: usize = replies.iter().map(|reply| reply.block_presences.len()).sum();
+            tracing::debug!(%peer, entries, blocks, presences, "bitswap wantlist");
+        }
         if !replies.is_empty() {
-            if let Err(err) = send_replies(&control, peer, version, &replies).await {
-                tracing::debug!(%peer, %err, "bitswap reply not sent");
+            match send_replies(&control, peer, version, &replies).await {
+                Ok(()) => tracing::debug!(%peer, messages = replies.len(), "bitswap reply sent"),
+                Err(err) => tracing::debug!(%peer, %err, "bitswap reply not sent"),
             }
         }
     }

@@ -59,6 +59,31 @@ struct Entry {
     announced: Option<u64>,
     due: Instant,
     announcing: bool,
+    /// Asked for by its own name, with [`Provided::add`] or as the root of a tree.
+    named: bool,
+    /// How many trees list it. It stays announced while it is named or listed.
+    listed: u32,
+    /// When it was given, so the first CID given is announced first among those due together.
+    order: u64,
+}
+
+/// What [`Provided::add_tree`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeAdded {
+    pub outcome: AddOutcome,
+    /// Members now listed under the root.
+    pub listed: usize,
+    /// CIDs the root listed before and nothing lists now, so the DHT should stop providing them.
+    pub dropped: Vec<Cid>,
+}
+
+/// What [`Provided::remove`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    /// The CID had been asked for by its own name.
+    pub was_named: bool,
+    /// The CIDs that are no longer announced at all, which the DHT should stop providing.
+    pub dropped: Vec<Cid>,
 }
 
 /// The key a provider record is stored under: the CID's multihash, as Kubo does, so a CIDv0 and a
@@ -69,6 +94,9 @@ pub fn provider_key(cid: &Cid) -> Vec<u8> {
 
 pub struct Provided {
     entries: HashMap<Vec<u8>, Entry>,
+    /// For each root given to [`Provided::add_tree`], the keys of the CIDs it lists.
+    trees: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    next_order: u64,
     reachability: Reachability,
     /// A relay holds a reservation for the node, so peers can reach it through the relay whatever
     /// AutoNAT says about a direct connection.
@@ -85,6 +113,8 @@ impl Provided {
     pub fn with_max(reannounce_every: Duration, max: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            trees: HashMap::new(),
+            next_order: 0,
             reachability: Reachability::Unknown,
             relayed: false,
             reannounce_every,
@@ -94,26 +124,112 @@ impl Provided {
 
     pub fn add(&mut self, cid: Cid, now: Instant) -> Result<AddOutcome, TooMany> {
         let key = provider_key(&cid);
-        if self.entries.contains_key(&key) {
-            return Ok(AddOutcome::AlreadyProvided);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            return Ok(if std::mem::replace(&mut entry.named, true) {
+                AddOutcome::AlreadyProvided
+            } else {
+                AddOutcome::Added
+            });
         }
         if self.entries.len() >= self.max {
             return Err(TooMany);
         }
-        self.entries.insert(
-            key,
-            Entry {
-                cid,
-                announced: None,
-                due: now,
-                announcing: false,
-            },
-        );
+        self.insert(cid, now, true);
         Ok(AddOutcome::Added)
     }
 
-    pub fn remove(&mut self, cid: &Cid) -> bool {
-        self.entries.remove(&provider_key(cid)).is_some()
+    /// Names `root` like [`Provided::add`] and lists `members` under it: they are announced for as
+    /// long as the root is, however many roots list the same one. A member that does not fit under
+    /// the limit is left out, never the root. Giving the same root again replaces its list.
+    pub fn add_tree(
+        &mut self,
+        root: Cid,
+        members: &[Cid],
+        now: Instant,
+    ) -> Result<TreeAdded, TooMany> {
+        let outcome = self.add(root, now)?;
+        let root_key = provider_key(&root);
+        let previous = self.trees.remove(&root_key).unwrap_or_default();
+        let mut listed: Vec<Vec<u8>> = Vec::new();
+        for member in members {
+            let key = provider_key(member);
+            if key == root_key || listed.contains(&key) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.listed += 1;
+            } else if self.entries.len() < self.max {
+                self.insert(*member, now, false).listed = 1;
+            } else {
+                continue;
+            }
+            listed.push(key);
+        }
+        let dropped = previous.iter().filter_map(|key| self.unlist(key)).collect();
+        let count = listed.len();
+        self.trees.insert(root_key, listed);
+        Ok(TreeAdded {
+            outcome,
+            listed: count,
+            dropped,
+        })
+    }
+
+    fn insert(&mut self, cid: Cid, now: Instant, named: bool) -> &mut Entry {
+        let order = self.next_order;
+        self.next_order += 1;
+        self.entries.entry(provider_key(&cid)).or_insert(Entry {
+            cid,
+            announced: None,
+            due: now,
+            announcing: false,
+            named,
+            listed: 0,
+            order,
+        })
+    }
+
+    /// One tree stops listing the CID under `key`. Returns it when nothing names or lists it any
+    /// more, and it is gone.
+    fn unlist(&mut self, key: &[u8]) -> Option<Cid> {
+        let entry = self.entries.get_mut(key)?;
+        entry.listed = entry.listed.saturating_sub(1);
+        if entry.listed > 0 || entry.named {
+            return None;
+        }
+        let cid = entry.cid;
+        self.entries.remove(key);
+        Some(cid)
+    }
+
+    /// Stops announcing `cid` by name, and what it listed unless another root lists it too.
+    pub fn remove(&mut self, cid: &Cid) -> Removed {
+        let key = provider_key(cid);
+        let was_named = self
+            .entries
+            .get_mut(&key)
+            .is_some_and(|entry| std::mem::replace(&mut entry.named, false));
+        if !was_named {
+            return Removed {
+                was_named,
+                dropped: Vec::new(),
+            };
+        }
+        let mut dropped: Vec<Cid> = self
+            .trees
+            .remove(&key)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|member| self.unlist(member))
+            .collect();
+        if self.entries.get(&key).is_some_and(|entry| entry.listed == 0) {
+            self.entries.remove(&key);
+            dropped.insert(0, *cid);
+        }
+        Removed {
+            was_named,
+            dropped,
+        }
     }
 
     /// True when a provider record would point at an address that works: the node is public, or a
@@ -167,7 +283,7 @@ impl Provided {
             .values_mut()
             .filter(|entry| !entry.announcing && entry.due <= now)
             .collect();
-        due.sort_by_key(|entry| entry.due);
+        due.sort_by_key(|entry| (entry.due, entry.order));
         due.into_iter()
             .take(room)
             .map(|entry| {
@@ -390,8 +506,8 @@ mod tests {
             Ok(AddOutcome::AlreadyProvided)
         );
         assert_eq!(provided.add(cid(b"c"), now), Err(TooMany));
-        assert!(provided.remove(&cid(b"a")));
-        assert!(!provided.remove(&cid(b"a")));
+        assert!(provided.remove(&cid(b"a")).was_named);
+        assert!(!provided.remove(&cid(b"a")).was_named);
         assert_eq!(provided.add(cid(b"c"), now), Ok(AddOutcome::Added));
         assert_eq!(MAX_PROVIDED, 1024);
     }
@@ -404,7 +520,7 @@ mod tests {
         assert_eq!(provider_key(&v0), provider_key(&v1));
         provided.add(v1, now).unwrap();
         assert_eq!(provided.add(v0, now), Ok(AddOutcome::AlreadyProvided));
-        assert!(provided.remove(&v0));
+        assert!(provided.remove(&v0).was_named);
         assert!(provided.snapshot().is_empty());
     }
 
@@ -441,5 +557,113 @@ mod tests {
         };
         assert_eq!(by(&a), Some(42));
         assert_eq!(by(&b), None);
+    }
+
+    fn ids(names: &[&[u8]]) -> Vec<Cid> {
+        names.iter().map(|name| cid(name)).collect()
+    }
+
+    #[test]
+    fn a_tree_announces_its_root_before_its_members() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let members = ids(&[b"one", b"two", b"three", b"four", b"five"]);
+        let root = cid(b"root");
+        let added = provided.add_tree(root, &members, now).unwrap();
+        assert_eq!(added.listed, 5);
+        assert_eq!(provided.snapshot().len(), 6);
+        assert_eq!(provided.take_due(now, 1), vec![root]);
+        assert_eq!(provided.take_due(now, 2), members[..2].to_vec());
+    }
+
+    #[test]
+    fn removing_the_root_removes_what_only_it_listed() {
+        let (mut provided, now) = state();
+        let members = ids(&[b"one", b"two"]);
+        let root = cid(b"root");
+        provided.add_tree(root, &members, now).unwrap();
+        let removed = provided.remove(&root);
+        assert!(removed.was_named);
+        assert_eq!(removed.dropped.len(), 3);
+        assert!(removed.dropped.contains(&root));
+        assert!(provided.snapshot().is_empty());
+        assert!(!provided.remove(&root).was_named);
+    }
+
+    #[test]
+    fn a_member_two_roots_list_stays_until_both_are_gone() {
+        let (mut provided, now) = state();
+        let shared = cid(b"shared file");
+        let (first, second) = (cid(b"first"), cid(b"second"));
+        provided.add_tree(first, &[shared], now).unwrap();
+        provided.add_tree(second, &[shared], now).unwrap();
+        let removed = provided.remove(&first);
+        assert_eq!(removed.dropped, vec![first]);
+        assert_eq!(provided.snapshot().len(), 2);
+        let removed = provided.remove(&second);
+        assert_eq!(removed.dropped.len(), 2);
+        assert!(provided.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_member_asked_for_by_name_survives_its_root() {
+        let (mut provided, now) = state();
+        let member = cid(b"member");
+        let root = cid(b"root");
+        provided.add_tree(root, &[member], now).unwrap();
+        assert_eq!(provided.add(member, now), Ok(AddOutcome::Added));
+        let removed = provided.remove(&root);
+        assert_eq!(removed.dropped, vec![root]);
+        assert_eq!(provided.snapshot().len(), 1);
+        assert!(provided.remove(&member).was_named);
+        assert!(provided.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_member_is_not_a_cid_that_can_be_removed_by_itself() {
+        let (mut provided, now) = state();
+        let member = cid(b"member");
+        provided.add_tree(cid(b"root"), &[member], now).unwrap();
+        assert!(!provided.remove(&member).was_named);
+        assert_eq!(provided.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn giving_a_root_again_keeps_what_was_announced_and_drops_what_left() {
+        let (mut provided, now) = state();
+        provided.set_reachability(Reachability::Public, now);
+        let (kept, gone, new) = (cid(b"kept"), cid(b"gone"), cid(b"new"));
+        let root = cid(b"root");
+        provided.add_tree(root, &[kept, gone], now).unwrap();
+        provided.take_due(now, 10);
+        provided.announced(&kept, now, 5);
+        let again = provided.add_tree(root, &[kept, new], now).unwrap();
+        assert_eq!(again.outcome, AddOutcome::AlreadyProvided);
+        assert_eq!(again.listed, 2);
+        assert_eq!(again.dropped, vec![gone]);
+        let by = |c: &Cid| {
+            provided
+                .snapshot()
+                .into_iter()
+                .find(|e| e.cid == c.to_string())
+                .map(|e| e.announced)
+        };
+        assert_eq!(by(&kept), Some(Some(5)));
+        assert_eq!(by(&new), Some(None));
+        assert_eq!(by(&gone), None);
+    }
+
+    #[test]
+    fn a_tree_fills_the_table_but_never_pushes_out_its_root() {
+        let mut provided = Provided::with_max(REANNOUNCE_EVERY, 4);
+        let now = Instant::now();
+        let members = ids(&[b"1", b"2", b"3", b"4", b"5"]);
+        let added = provided.add_tree(cid(b"root"), &members, now).unwrap();
+        assert_eq!(added.listed, 3);
+        assert_eq!(provided.snapshot().len(), 4);
+        assert_eq!(
+            provided.add_tree(cid(b"other"), &members, now),
+            Err(TooMany)
+        );
     }
 }

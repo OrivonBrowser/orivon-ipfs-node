@@ -13,7 +13,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use orivon_ipfs_core::parse_cid;
 use orivon_ipfs_serve::{
-    parse_and_verify_car_yielding, AddOutcome, DialError, KeptBlocks, ProvideError, ServeNode,
+    announce_set, parse_and_verify_car_yielding, DialError, KeptBlocks, ProvideError, ServeNode,
     MAX_PROVIDED,
 };
 use std::sync::Arc;
@@ -187,20 +187,38 @@ fn json_with(status: StatusCode, value: serde_json::Value) -> Response {
 }
 
 async fn post_provide(State(state): State<ServeApiState>, body: Bytes) -> Response {
-    let cid = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let cid = request
+        .as_ref()
         .and_then(|value| value.get("cid")?.as_str().map(str::to_string))
         .and_then(|text| parse_cid(&text).ok());
     let Some(cid) = cid else {
         return text(StatusCode::BAD_REQUEST, "body must be {\"cid\": \"<cid>\"}");
     };
+    // The entries of a folder are announced with it unless the caller says not to.
+    let tree = match request.as_ref().and_then(|value| value.get("tree")) {
+        None => true,
+        Some(serde_json::Value::Bool(tree)) => *tree,
+        Some(_) => return text(StatusCode::BAD_REQUEST, "\"tree\" must be true or false"),
+    };
     if state.kept.get(&cid).is_none() {
         return text(StatusCode::NOT_FOUND, "that block is not kept");
     }
-    match state.node.provide(cid).await {
-        Ok(AddOutcome::Added | AddOutcome::AlreadyProvided) => json_with(
+    let (members, cut) = if tree {
+        let (set, cut) = announce_set(&state.kept, &cid, MAX_PROVIDED);
+        (set.into_iter().skip(1).collect::<Vec<_>>(), cut)
+    } else {
+        (Vec::new(), false)
+    };
+    let wanted = members.len();
+    match state.node.provide_tree(cid, members).await {
+        Ok((_, listed)) => json_with(
             StatusCode::ACCEPTED,
-            serde_json::json!({ "cid": cid.to_string() }),
+            serde_json::json!({
+                "cid": cid.to_string(),
+                "children": listed,
+                "truncated": cut || listed < wanted,
+            }),
         ),
         Err(ProvideError::TooMany) => text(
             StatusCode::TOO_MANY_REQUESTS,
@@ -241,7 +259,8 @@ async fn status(State(state): State<ServeApiState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orivon_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_RAW};
+    use orivon_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_DAG_PB, CODEC_RAW};
+    use prost::Message;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -556,6 +575,152 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), 400, "{bad}");
         }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PbNode {
+        #[prost(bytes = "vec", optional, tag = "1")]
+        data: Option<Vec<u8>>,
+        #[prost(message, repeated, tag = "2")]
+        links: Vec<PbLink>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PbLink {
+        #[prost(bytes = "vec", optional, tag = "1")]
+        hash: Option<Vec<u8>>,
+        #[prost(string, optional, tag = "2")]
+        name: Option<String>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct UnixfsData {
+        #[prost(int32, optional, tag = "1")]
+        kind: Option<i32>,
+    }
+
+    /// A UnixFS directory block naming `entries`.
+    fn folder_block(entries: &[(&str, cid::Cid)]) -> (cid::Cid, Vec<u8>) {
+        let bytes = PbNode {
+            data: Some(UnixfsData { kind: Some(1) }.encode_to_vec()),
+            links: entries
+                .iter()
+                .map(|(name, cid)| PbLink {
+                    hash: Some(cid.to_bytes()),
+                    name: Some(name.to_string()),
+                })
+                .collect(),
+        }
+        .encode_to_vec();
+        (cid_from_data(CODEC_DAG_PB, &bytes), bytes)
+    }
+
+    async fn providing(client: &reqwest::Client, base: &str) -> Vec<String> {
+        let status: serde_json::Value = client
+            .get(format!("{base}/status"))
+            .header(KEY_HEADER, KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        status["providing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["cid"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn provide_announces_a_folders_entries_with_it_and_delete_takes_them_back() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let files: Vec<Vec<u8>> = (0..3u8).map(|index| vec![index; 64]).collect();
+        let file_cids: Vec<cid::Cid> = files.iter().map(|data| cid_from_data(CODEC_RAW, data)).collect();
+        let (folder, folder_bytes) = folder_block(&[
+            ("a", file_cids[0]),
+            ("b", file_cids[1]),
+            ("c", file_cids[2]),
+        ]);
+        let mut blocks: Vec<(cid::Cid, Vec<u8>)> = file_cids.iter().copied().zip(files).collect();
+        blocks.push((folder, folder_bytes));
+        kept.insert_all(blocks).unwrap();
+
+        let accepted = provide(&client, &base, &folder.to_string()).await;
+        assert_eq!(accepted.status(), 202);
+        let body: serde_json::Value = accepted.json().await.unwrap();
+        assert_eq!(body["children"], 3);
+        assert_eq!(body["truncated"], false);
+        let mut expected: Vec<String> = file_cids.iter().map(|cid| cid.to_string()).collect();
+        expected.push(folder.to_string());
+        expected.sort();
+        assert_eq!(providing(&client, &base).await, expected);
+
+        let deleted = client
+            .delete(format!("{base}/provide/{folder}"))
+            .header(KEY_HEADER, KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 200);
+        assert!(providing(&client, &base).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provide_can_leave_a_folders_entries_out() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let file = cid_from_data(CODEC_RAW, b"only file");
+        let (folder, folder_bytes) = folder_block(&[("only", file)]);
+        kept.insert_all(vec![(file, b"only file".to_vec()), (folder, folder_bytes)])
+            .unwrap();
+        let response = client
+            .post(format!("{base}/provide"))
+            .header(KEY_HEADER, KEY)
+            .body(format!(r#"{{"cid":"{folder}","tree":false}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["children"], 0);
+        assert_eq!(providing(&client, &base).await, vec![folder.to_string()]);
+        let bad = client
+            .post(format!("{base}/provide"))
+            .header(KEY_HEADER, KEY)
+            .body(format!(r#"{{"cid":"{folder}","tree":"yes"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn a_folder_bigger_than_the_limit_is_announced_as_far_as_it_fits() {
+        let (base, kept) = serve_listening().await;
+        let client = reqwest::Client::new();
+        let files: Vec<Vec<u8>> = (0..MAX_PROVIDED as u32 + 10)
+            .map(|index| index.to_be_bytes().to_vec())
+            .collect();
+        let entries: Vec<(String, cid::Cid)> = files
+            .iter()
+            .enumerate()
+            .map(|(index, data)| (format!("f{index}"), cid_from_data(CODEC_RAW, data)))
+            .collect();
+        let named: Vec<(&str, cid::Cid)> = entries.iter().map(|(name, cid)| (name.as_str(), *cid)).collect();
+        let (folder, folder_bytes) = folder_block(&named);
+        let mut blocks: Vec<(cid::Cid, Vec<u8>)> = entries.iter().map(|(_, cid)| *cid).zip(files).collect();
+        blocks.push((folder, folder_bytes));
+        kept.insert_all(blocks).unwrap();
+
+        let accepted = provide(&client, &base, &folder.to_string()).await;
+        assert_eq!(accepted.status(), 202);
+        let body: serde_json::Value = accepted.json().await.unwrap();
+        assert_eq!(body["children"], MAX_PROVIDED - 1);
+        assert_eq!(body["truncated"], true);
+        assert_eq!(providing(&client, &base).await.len(), MAX_PROVIDED);
     }
 
     #[tokio::test]

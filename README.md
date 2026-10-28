@@ -22,7 +22,7 @@ native program.
 | `GET /ipns/<key>?format=ipns-record` | A signed IPNS record, checked before it is returned. |
 | `GET /id` | The node's peer ID (serve mode). |
 | `POST /blocks`, `POST /dial` | Give the node blocks as a CAR file; connect it to a peer (serve mode). |
-| `POST /provide`, `DELETE /provide/<cid>` | Announce, or stop announcing, a held block on the DHT. |
+| `POST /provide`, `DELETE /provide/<cid>` | Announce, or stop announcing, a held block on the DHT, with the folders and files below it. |
 | `GET /status` | Peer ID, listen and external addresses, relay reservations, reachability, provided CIDs. |
 
 `orivon/README.md` describes every request, flag and limit.
