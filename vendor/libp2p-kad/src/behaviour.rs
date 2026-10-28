@@ -1562,6 +1562,15 @@ where
             } => {
                 let provider_id = self.local_peer_id;
                 let external_addresses = self.external_addresses.iter().cloned().collect();
+                let targets: Vec<PeerId> = q.peers.into_peerids_iter().collect();
+                tracing::debug!(
+                    target: "orivon_kad_announce",
+                    targets = targets.len(),
+                    walk_requests = q.stats.num_requests(),
+                    walk_successes = q.stats.num_successes(),
+                    walk_failures = q.stats.num_failures(),
+                    "provider announcement: walk done, sending ADD_PROVIDER"
+                );
                 let info = QueryInfo::AddProvider {
                     context,
                     key,
@@ -1571,8 +1580,7 @@ where
                         get_closest_peers_stats: q.stats,
                     },
                 };
-                self.queries
-                    .continue_fixed(query_id, q.peers.into_peerids_iter(), info);
+                self.queries.continue_fixed(query_id, targets, info);
                 None
             }
 
@@ -1587,7 +1595,16 @@ where
             } => match context {
                 AddProviderContext::Publish => Some(Event::OutboundQueryProgressed {
                     id: query_id,
-                    stats: get_closest_peers_stats.merge(q.stats),
+                    stats: {
+                        tracing::debug!(
+                            target: "orivon_kad_announce",
+                            sent = q.stats.num_requests(),
+                            delivered = q.stats.num_successes(),
+                            failed = q.stats.num_failures(),
+                            "provider announcement: ADD_PROVIDER phase done"
+                        );
+                        get_closest_peers_stats.merge(q.stats)
+                    },
                     result: QueryResult::StartProviding(Ok(AddProviderOk { key })),
                     step: ProgressStep::first_and_last(),
                 }),

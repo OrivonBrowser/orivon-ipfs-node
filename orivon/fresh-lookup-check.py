@@ -227,6 +227,7 @@ class Rig:
             ("Routing.Type", '"dhtclient"'),
             ("Discovery.MDNS.Enabled", "false"),
             ("Swarm.DisableNatPortMap", "true"),
+            ("Swarm.AddrFilters", '["/ip4/127.0.0.0/ipcidr/8", "/ip6/::1/ipcidr/128", "/ip4/10.0.0.0/ipcidr/8", "/ip4/172.16.0.0/ipcidr/12", "/ip4/192.168.0.0/ipcidr/16", "/ip4/169.254.0.0/ipcidr/16", "/ip6/fe80::/ipcidr/10", "/ip6/fd00::/ipcidr/8"]'),
             ("Addresses.API", f'"/ip4/127.0.0.1/tcp/{free_port()}"'),
             ("Addresses.Gateway", f'"/ip4/127.0.0.1/tcp/{free_port()}"'),
             ("Addresses.Swarm", f'["/ip4/0.0.0.0/tcp/{free_port()}"]'),
@@ -235,6 +236,9 @@ class Rig:
         env = dict(os.environ, IPFS_PATH=self.kubo_repo)
         self.kubo = Proc("kubo-daemon", [a.ipfs, "daemon"], self.out, env=env)
         end = time.monotonic() + 120
+        api_file = os.path.join(self.kubo_repo, "api")
+        while time.monotonic() < end and not os.path.exists(api_file):
+            time.sleep(1)
         while time.monotonic() < end:
             if self.ipfs(self.kubo_repo, "id", timeout=20).returncode == 0:
                 break
@@ -430,7 +434,7 @@ def main():
     p.add_argument("--fetch-timeout", type=int, default=90)
     p.add_argument("--announce-timeout", type=int, default=300)
     p.add_argument("--budget-min", type=int, default=45, help="no new share is started after this")
-    p.add_argument("--serve-trace", default="warn,orivon_ipfs_serve=debug,libp2p_relay=debug,libp2p_kad=debug")
+    p.add_argument("--serve-trace", default="warn,orivon_ipfs_serve=debug,libp2p_relay=debug,libp2p_kad=debug,orivon_kad_announce=debug")
     p.add_argument("--fetch-trace", default="warn,orivon_ipfs_routing=info,orivon_ipfs_retrieval=info")
     args = p.parse_args()
     rig = Rig(args)

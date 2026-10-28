@@ -778,6 +778,16 @@ fn log_connection_event(event: &SwarmEvent<BehaviourEvent>) {
             cause = ?cause,
             "connection closed"
         ),
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => tracing::debug!(
+            peer = ?peer_id,
+            %error,
+            "outgoing connection failed"
+        ),
+        SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => tracing::debug!(
+            address = %send_back_addr,
+            %error,
+            "incoming connection refused"
+        ),
         _ => {}
     }
 }
