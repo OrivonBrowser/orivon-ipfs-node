@@ -20,6 +20,16 @@
 #                 browser reads a path. A small routing service stands in for the DHT: it names the
 #                 node as a provider of exactly the CIDs the node reports in GET /status as provided.
 #
+#   TREE=false    asks for the root alone to be announced (the default announces the folder's
+#                 directories and each file's first block with it); only a fetcher that finds files
+#                 through the routing system tells the two apart.
+#   PROBE_FROM/PROBE_TO (with FILES large enough, FETCHER=kubo ROUTING=dht): before the ladder,
+#                 looks up f<from>..f<to>, files the ladder does not ask for, through the DHT, one at
+#                 a time, and prints how many announcements a fresh Kubo found (`PROBE` lines).
+#
+# The DHT is the public one: a lookup of an announced CID misses now and then (about one in ten from a
+# fresh Kubo), so a single failed step there is run again before it is read as a fault.
+#
 # Prints one `LADDER` line per step and exits 1 when a step failed. Needs curl, python3 and cmp.
 set -u
 NODE_BIN=${NODE_BIN:?set NODE_BIN}

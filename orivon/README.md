@@ -248,7 +248,9 @@ in-process AutoNAT server.
 asks for another after 0, 20, 60 and 120 seconds, over Orivon's circuit relay and directly. The
 fetcher is a scratch Kubo (with and without its Bitswap broadcast control, with and without the
 DHT) or a second copy of the node (`FETCHER=node`, with a small routing service that names the node
-as provider of what it reports as provided). Every step must find its file. The Bitswap side is
+as provider of what it reports as provided). Every step must find its file; a fetcher that looks files up in the public DHT now and then misses an
+announced CID (about one in ten from a fresh Kubo), so a failed step there is run again before it is read
+as a fault, and `TREE=false` shows what announcing the root alone costs. The Bitswap side is
 also tested in process, over a relay and directly, in
 `crates/orivon-ipfs-serve/tests/later_connection.rs`.
 
