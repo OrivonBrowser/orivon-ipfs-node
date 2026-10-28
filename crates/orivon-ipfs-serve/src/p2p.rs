@@ -29,7 +29,7 @@ pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
 /// Inbound connections still being set up.
 pub const MAX_PENDING_INBOUND: u32 = 32;
 /// Established connections this node opened: the peers it keeps, the DHT, the AutoNAT servers.
-pub const MAX_OUTBOUND_CONNECTIONS: u32 = 32;
+pub const MAX_OUTBOUND_CONNECTIONS: u32 = 128;
 /// A connection with no open stream closes after this, unless its peer is one the node keeps.
 pub(crate) const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
