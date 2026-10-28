@@ -291,28 +291,35 @@ class Rig:
         return {"ok": ok, "seconds": seconds, "announce_s": round(announced, 1), "note": note, **extra}
 
     def fetch_delegated(self, share):
+        """Asks the way the node does: ndjson preferred, once a second, until a provider is named."""
         announced = self.announce(share)
         if announced is None:
             return {"ok": False, "note": "not announced"}
         started = time.monotonic()
-        polls, headers = 0, None
+        polls, headers, last = 0, None, None
         while time.monotonic() - started < self.args.fetch_timeout:
+            asked = time.monotonic()
             code, head, body = http(
                 "GET", "https://delegated-ipfs.dev/routing/v1/providers/" + share["root"],
-                {"Accept": "application/json"}, timeout=20,
+                {"Accept": "application/x-ndjson, application/json"}, timeout=20,
             )
             polls += 1
+            last = {"code": code, "ms": int((time.monotonic() - asked) * 1000), "type": head.get("Content-Type", head.get("content-type"))}
             if headers is None:
-                headers = {k.lower(): v for k, v in head.items() if k.lower() in ("cache-control", "age", "cf-cache-status", "x-cache", "server", "via")}
+                headers = {k.lower(): v for k, v in head.items() if k.lower() in ("cache-control", "age", "cf-cache-status", "x-cache", "server", "via", "content-type")}
+            found = []
             if code == 200:
-                try:
-                    found = json.loads(body).get("Providers") or []
-                except ValueError:
-                    found = []
-                if found:
-                    return {"ok": True, "seconds": round(time.monotonic() - started, 1), "announce_s": round(announced, 1), "polls": polls, "first_headers": headers}
+                for line in body.decode(errors="replace").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(item, dict):
+                        found += item.get("Providers") or ([item] if item.get("ID") else [])
+            if found:
+                return {"ok": True, "seconds": round(time.monotonic() - started, 1), "announce_s": round(announced, 1), "polls": polls, "first_headers": headers, "found": found[:2]}
             time.sleep(1)
-        return {"ok": False, "seconds": self.args.fetch_timeout, "announce_s": round(announced, 1), "polls": polls, "first_headers": headers}
+        return {"ok": False, "seconds": self.args.fetch_timeout, "announce_s": round(announced, 1), "polls": polls, "first_headers": headers, "last": last}
 
     # Pipelines
 

@@ -1804,9 +1804,11 @@ impl Default for DhtTuning {
 
 impl DhtTuning {
     fn from_env() -> Self {
-        fn number(name: &str) -> Option<u64> {
-            std::env::var(name).ok()?.trim().parse().ok()
-        }
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let number = |name: &str| -> Option<u64> { var(name)?.trim().parse().ok() };
         let mut tuning = Self::default();
         if let Some(n) = number("ORIVON_IPFS_DHT_PARALLELISM") {
             tuning.parallelism = n.clamp(1, 64) as usize;
@@ -3107,6 +3109,31 @@ mod tests {
             "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa"
         );
         assert_eq!(addr.to_string(), "/dnsaddr/ny5.bootstrap.libp2p.io");
+    }
+
+    #[test]
+    fn dht_tuning_reads_numbers_within_bounds_and_ignores_the_rest() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let default = DhtTuning::from_vars(vars(&[]));
+        assert_eq!(default.parallelism, DHT_PARALLELISM);
+        assert_eq!(default.established, DHT_MAX_ESTABLISHED_CONNECTIONS);
+        let tuned = DhtTuning::from_vars(vars(&[
+            ("ORIVON_IPFS_DHT_PARALLELISM", " 10 "),
+            ("ORIVON_IPFS_DHT_CONNECTIONS", "9999"),
+            ("ORIVON_IPFS_DHT_CONNECT_TIMEOUT_MS", "1"),
+            ("ORIVON_IPFS_DHT_PENDING_CONNECTIONS", "many"),
+        ]));
+        assert_eq!(tuned.parallelism, 10);
+        assert_eq!(tuned.established, 256);
+        assert_eq!(tuned.connection_timeout, Duration::from_millis(500));
+        assert_eq!(tuned.pending_outgoing, DHT_MAX_PENDING_OUTGOING_CONNECTIONS);
     }
 
     #[test]
