@@ -18,6 +18,7 @@ mod node;
 mod p2p;
 mod provide;
 mod relay;
+mod tree;
 
 pub use bitswap::{
     cid_prefix, reply_to_wantlist, BitswapMessage, BlockPayload, BlockPresence, Version, WantEntry,
@@ -31,3 +32,4 @@ pub use p2p::{
 };
 pub use provide::{AddOutcome, ProvidingEntry, Reachability, MAX_PROVIDED, REANNOUNCE_EVERY};
 pub use relay::{parse_relay_addr, MAX_RELAYS};
+pub use tree::announce_set;

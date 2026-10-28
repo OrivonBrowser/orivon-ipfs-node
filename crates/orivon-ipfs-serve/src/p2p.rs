@@ -176,6 +176,15 @@ pub(crate) fn without_peer(addr: &Multiaddr) -> Multiaddr {
     addr
 }
 
+/// Tells the DHT behaviour to stop announcing each of `cids`.
+fn stop_providing(swarm: &mut Swarm<Behaviour>, cids: &[Cid]) {
+    if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
+        for cid in cids {
+            kad.stop_providing(&RecordKey::new(&provider_key(cid)));
+        }
+    }
+}
+
 /// What AutoNAT's status means for announcing. Public needs an address AutoNAT confirmed, since
 /// that is the address the provider record carries.
 fn verdict(
@@ -271,21 +280,26 @@ impl P2p {
         self.relays.listen(swarm, now);
     }
 
-    pub(crate) fn provide(&mut self, cid: Cid, now: Instant) -> Result<AddOutcome, ProvideError> {
+    /// Announces `cid` and, listed under it, `members`; returns how many members fit.
+    pub(crate) fn provide(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        cid: Cid,
+        members: &[Cid],
+        now: Instant,
+    ) -> Result<(AddOutcome, usize), ProvideError> {
         if !self.dht {
             return Err(ProvideError::NoDht);
         }
-        Ok(self.provided.add(cid, now)?)
+        let added = self.provided.add_tree(cid, members, now)?;
+        stop_providing(swarm, &added.dropped);
+        Ok((added.outcome, added.listed))
     }
 
     pub(crate) fn unprovide(&mut self, swarm: &mut Swarm<Behaviour>, cid: &Cid) -> bool {
         let removed = self.provided.remove(cid);
-        if removed {
-            if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
-                kad.stop_providing(&RecordKey::new(&provider_key(cid)));
-            }
-        }
-        removed
+        stop_providing(swarm, &removed.dropped);
+        removed.was_named
     }
 
     pub(crate) fn status(&self, peer: PeerId) -> NodeStatus {

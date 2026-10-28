@@ -111,7 +111,8 @@ enum Command {
     Dial(DialCommand),
     Provide {
         cid: Cid,
-        respond: oneshot::Sender<Result<AddOutcome, ProvideError>>,
+        members: Vec<Cid>,
+        respond: oneshot::Sender<Result<(AddOutcome, usize), ProvideError>>,
     },
     Unprovide {
         cid: Cid,
@@ -221,7 +222,24 @@ impl ServeNode {
 
     /// Announces `cid` on the DHT whenever the node is reachable, and again every 12 hours.
     pub async fn provide(&self, cid: Cid) -> Result<AddOutcome, ProvideError> {
-        self.ask(|respond| Command::Provide { cid, respond }).await
+        self.provide_tree(cid, Vec::new())
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Announces `cid` and, until `cid` is stopped, `members` with it (the entries of a folder, say).
+    /// Members beyond the limit on announced CIDs are left out; the count that fit comes back.
+    pub async fn provide_tree(
+        &self,
+        cid: Cid,
+        members: Vec<Cid>,
+    ) -> Result<(AddOutcome, usize), ProvideError> {
+        self.ask(|respond| Command::Provide {
+            cid,
+            members,
+            respond,
+        })
+        .await
     }
 
     /// Stops announcing `cid`; false when it was not being announced.
@@ -572,9 +590,9 @@ async fn run<S>(
                 let Some(command) = command else { return };
                 let DialCommand { addr, peer, respond } = match command {
                     Command::Dial(dial) => dial,
-                    Command::Provide { cid, respond } => {
+                    Command::Provide { cid, members, respond } => {
                         let _ = respond.send(match p2p.as_mut() {
-                            Some(p2p) => p2p.provide(cid, Instant::now()),
+                            Some(p2p) => p2p.provide(&mut swarm, cid, &members, Instant::now()),
                             None => Err(ProvideError::NotEnabled),
                         });
                         continue;

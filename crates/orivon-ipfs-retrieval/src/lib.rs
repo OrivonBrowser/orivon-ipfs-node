@@ -222,6 +222,10 @@ const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS_ENV: &str =
 const ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV: &str =
     "ORIVON_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
+// A peer reachable only through a circuit relay may have lost its connection since the last block:
+// the shortcut then spends a connection to the relay, the circuit through it and the peer's answer
+// on a new stream, about 2.5 s together. Two seconds would give up on a peer that is answering.
+const BITSWAP_SESSION_RELAYED_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(8);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
 // The per-peer read path has its own 10s timeout. This caps broader shared
@@ -4794,7 +4798,7 @@ impl HttpRetriever {
                 .fetch_with_context(*cid, peers, bitswap_command_context)
                 .await
         };
-        let result = match timeout(BITSWAP_SESSION_SHORTCUT_TIMEOUT, fetch).await {
+        let result = match timeout(session_shortcut_timeout(&peers_for_record), fetch).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(err))) => {
                 tracing::info!(
@@ -10141,6 +10145,24 @@ fn analyze_bitswap_multiaddr(
 
 fn parse_peer_id(id: &str) -> Option<PeerId> {
     PeerId::from_str(id).ok()
+}
+
+/// How long the session shortcut waits for `peers`: longer when each one is known only by circuit
+/// addresses, because a lost connection to it costs a new circuit before any block can move.
+fn session_shortcut_timeout(peers: &[BitswapPeer]) -> Duration {
+    let only_relayed = !peers.is_empty()
+        && peers.iter().all(|peer| {
+            !peer.addrs.is_empty()
+                && peer
+                    .addrs
+                    .iter()
+                    .all(|addr| addr.iter().any(|part| matches!(part, Protocol::P2pCircuit)))
+        });
+    if only_relayed {
+        BITSWAP_SESSION_RELAYED_SHORTCUT_TIMEOUT
+    } else {
+        BITSWAP_SESSION_SHORTCUT_TIMEOUT
+    }
 }
 
 /// True for `<relay address>/p2p/<relay id>/p2p-circuit`, with the provider's own `/p2p/<peer id>`
@@ -16487,6 +16509,39 @@ mod bitswap_tests {
             .await;
 
         assert!(retriever.recent_bitswap_peers().await.is_empty());
+    }
+
+    #[test]
+    fn the_session_shortcut_waits_longer_only_for_peers_reachable_through_a_relay() {
+        let id = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let relay = "12D3KooWReTq9frXSU18aXYvksPBQRWj9qafTSB4gxgUg6QqqnqJ";
+        let peer = |addrs: &[String]| BitswapPeer {
+            id,
+            addrs: addrs.iter().map(|addr| addr.parse().unwrap()).collect(),
+            skip_want_have: true,
+            force_want_block: false,
+            force_want_have: false,
+        };
+        let circuit = format!("/ip4/152.228.138.30/tcp/4003/p2p/{relay}/p2p-circuit/p2p/{id}");
+        let direct = "/ip4/127.0.0.1/tcp/4001".to_string();
+
+        assert_eq!(
+            session_shortcut_timeout(&[peer(&[circuit.clone()])]),
+            BITSWAP_SESSION_RELAYED_SHORTCUT_TIMEOUT
+        );
+        assert_eq!(
+            session_shortcut_timeout(&[peer(&[circuit.clone(), direct.clone()])]),
+            BITSWAP_SESSION_SHORTCUT_TIMEOUT
+        );
+        assert_eq!(
+            session_shortcut_timeout(&[peer(&[circuit.clone()]), peer(&[direct.clone()])]),
+            BITSWAP_SESSION_SHORTCUT_TIMEOUT
+        );
+        assert_eq!(
+            session_shortcut_timeout(&[peer(&[])]),
+            BITSWAP_SESSION_SHORTCUT_TIMEOUT
+        );
+        assert_eq!(session_shortcut_timeout(&[]), BITSWAP_SESSION_SHORTCUT_TIMEOUT);
     }
 
     #[tokio::test]
