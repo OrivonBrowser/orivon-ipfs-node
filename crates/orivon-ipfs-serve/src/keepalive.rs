@@ -27,6 +27,11 @@ pub(crate) struct Behaviour {
 }
 
 impl Behaviour {
+    /// True while the connections to `peer` are kept open.
+    pub(crate) fn keeps(&self, peer: &PeerId) -> bool {
+        self.chosen.contains(peer)
+    }
+
     /// Keeps (or stops keeping) every connection to `peer`, now and in the future.
     pub(crate) fn set(&mut self, peer: PeerId, keep: bool) {
         let changed = if keep {

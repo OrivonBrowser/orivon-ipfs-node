@@ -53,11 +53,14 @@ const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const EMPTY_DELEGATED_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(100);
-const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
-const DHT_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 8;
-const DHT_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
-const DHT_PARALLELISM: usize = 3;
+// A walk asks a hundred peers, most of which never answer, so it needs many dials at once and
+// must not hold on to the ones that did: a limit it reaches makes its later dials fail, and a walk
+// whose dials fail never reaches the peers nearest the key.
+const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const DHT_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 32;
+const DHT_MAX_ESTABLISHED_CONNECTIONS: u32 = 64;
+const DHT_PARALLELISM: usize = 10;
 /// After the first server names a provider it can reach, the walk waits this long for more.
 const DHT_PROVIDER_GRACE: Duration = Duration::from_millis(250);
 /// The peers the light DHT starts from, as `<address>/p2p/<peer id>`.

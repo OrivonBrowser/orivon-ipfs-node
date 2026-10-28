@@ -37,6 +37,10 @@ ROUTERS = "https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1"
 METHODS = ["node-auto", "node-dht", "kubo-find", "kubo-cat", "delegated"]
 # `node-dht:wide` is node-dht with the environment of the preset named after the colon.
 PRESETS = {
+    "old": {
+        "ORIVON_IPFS_DHT_PARALLELISM": "3", "ORIVON_IPFS_DHT_CONNECTIONS": "16", "ORIVON_IPFS_DHT_PENDING_CONNECTIONS": "8",
+        "ORIVON_IPFS_DHT_CONNECT_TIMEOUT_MS": "10000", "ORIVON_IPFS_DHT_IDLE_TIMEOUT_MS": "20000",
+    },
     "par10": {"ORIVON_IPFS_DHT_PARALLELISM": "10"},
     "wide": {"ORIVON_IPFS_DHT_PARALLELISM": "10", "ORIVON_IPFS_DHT_CONNECTIONS": "64", "ORIVON_IPFS_DHT_PENDING_CONNECTIONS": "32"},
     "fast": {

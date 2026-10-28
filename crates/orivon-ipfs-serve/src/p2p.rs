@@ -12,6 +12,7 @@ use crate::provide::{
     REANNOUNCE_EVERY,
 };
 use crate::relay::Relays;
+use crate::trim::Trimmer;
 use cid::Cid;
 use libp2p::autonat;
 use libp2p::kad::{self, QueryId, QueryResult, RecordKey};
@@ -29,7 +30,8 @@ pub const MAX_CONNECTIONS_PER_PEER: u32 = 4;
 /// Inbound connections still being set up.
 pub const MAX_PENDING_INBOUND: u32 = 32;
 /// Established connections this node opened: the peers it keeps, the DHT, the AutoNAT servers.
-pub const MAX_OUTBOUND_CONNECTIONS: u32 = 32;
+/// [`Trimmer`] closes the oldest well before this is reached, so a dial is never refused for it.
+pub const MAX_OUTBOUND_CONNECTIONS: u32 = 64;
 /// A connection with no open stream closes after this, unless its peer is one the node keeps.
 pub(crate) const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -235,6 +237,7 @@ pub(crate) struct P2p {
     observations: Observations,
     autonat_servers: HashSet<PeerId>,
     relays: Relays,
+    trim: Trimmer,
     next_bootstrap: Instant,
 }
 
@@ -271,6 +274,7 @@ impl P2p {
             observations: Observations::new(config.min_observations),
             autonat_servers: HashSet::new(),
             relays: Relays::new(relays, now),
+            trim: Trimmer::default(),
             next_bootstrap: now + KAD_BOOTSTRAP_EVERY,
         }
     }
@@ -387,6 +391,18 @@ impl P2p {
             SwarmEvent::ExternalAddrExpired { address } => {
                 self.external.remove(address);
             }
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
+            } if endpoint.is_dialer() => {
+                self.trim.opened(*connection_id, *peer_id, now);
+                self.trim_outbound(swarm, now);
+            }
+            SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                self.trim.closed(connection_id);
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
@@ -398,6 +414,26 @@ impl P2p {
                 self.sync_reachability(swarm, now);
             }
             _ => {}
+        }
+    }
+
+    /// Closes the oldest connections this node opened once there are too many. The relays, the
+    /// peers a page asked to keep and the AutoNAT servers stay open.
+    fn trim_outbound(&mut self, swarm: &mut Swarm<Behaviour>, now: Instant) {
+        let relays = &self.relays;
+        let autonat_servers = &self.autonat_servers;
+        let keepalive = swarm.behaviour().keepalive.as_ref();
+        let closing = self.trim.excess(now, |peer| {
+            relays.is_relay(peer)
+                || autonat_servers.contains(peer)
+                || keepalive.is_some_and(|kept| kept.keeps(peer))
+        });
+        if closing.is_empty() {
+            return;
+        }
+        tracing::debug!(closing = closing.len(), "closing the oldest outbound connections");
+        for connection in closing {
+            swarm.close_connection(connection);
         }
     }
 

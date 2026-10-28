@@ -387,17 +387,13 @@ async fn build_swarm(
         None => connection_limits::ConnectionLimits::default()
             .with_max_pending_outgoing(Some(32))
             .with_max_established(Some(2 * MAX_PEERS as u32)),
-        Some(_) => {
-            let outbound = env_number("ORIVON_IPFS_SERVE_OUTBOUND", MAX_OUTBOUND_CONNECTIONS);
-            let pending = env_number("ORIVON_IPFS_SERVE_PENDING_OUTBOUND", 32);
-            connection_limits::ConnectionLimits::default()
-                .with_max_pending_outgoing(Some(pending))
-                .with_max_pending_incoming(Some(MAX_PENDING_INBOUND))
-                .with_max_established_incoming(Some(MAX_INBOUND_CONNECTIONS))
-                .with_max_established_outgoing(Some(outbound))
-                .with_max_established(Some(MAX_INBOUND_CONNECTIONS + outbound))
-                .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER))
-        }
+        Some(_) => connection_limits::ConnectionLimits::default()
+            .with_max_pending_outgoing(Some(32))
+            .with_max_pending_incoming(Some(MAX_PENDING_INBOUND))
+            .with_max_established_incoming(Some(MAX_INBOUND_CONNECTIONS))
+            .with_max_established_outgoing(Some(MAX_OUTBOUND_CONNECTIONS))
+            .with_max_established(Some(MAX_INBOUND_CONNECTIONS + MAX_OUTBOUND_CONNECTIONS))
+            .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER)),
     };
     let behaviour = Behaviour {
         stream: libp2p_stream::Behaviour::new(),
@@ -423,22 +419,11 @@ async fn build_swarm(
         tokio::spawn(future);
     })
     .with_idle_connection_timeout(if p2p.is_some() {
-        Duration::from_millis(u64::from(env_number(
-            "ORIVON_IPFS_SERVE_IDLE_MS",
-            P2P_IDLE_TIMEOUT.as_millis() as u32,
-        )))
+        P2P_IDLE_TIMEOUT
     } else {
         IDLE_CONNECTION_TIMEOUT
     });
     Ok(libp2p::Swarm::new(transport, behaviour, local_peer, config))
-}
-
-/// A number from the environment for a measurement, within 1 and 120 000, or `default`.
-fn env_number(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .map_or(default, |n| n.clamp(1, 120_000))
 }
 
 /// A DHT client: it asks the Amino DHT and announces on it, and does not answer its queries.
@@ -795,18 +780,29 @@ fn log_connection_event(event: &SwarmEvent<BehaviourEvent>) {
         ),
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => tracing::debug!(
             peer = ?peer_id,
-            %error,
-            cause = %std::error::Error::source(error)
-                .map_or_else(String::new, |source| source.to_string()),
+            error = %error_chain(error),
             "outgoing connection failed"
         ),
         SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => tracing::debug!(
             address = %send_back_addr,
-            %error,
+            error = %error_chain(error),
             "incoming connection refused"
         ),
         _ => {}
     }
+}
+
+/// An error and the causes under it: a refused dial says only that it was refused until the limit
+/// that refused it is read.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    text
 }
 
 /// Asks the swarm to hold the connections to `peer` open (or to let them close when idle).

@@ -19,6 +19,7 @@ mod p2p;
 mod provide;
 mod relay;
 mod tree;
+mod trim;
 
 pub use bitswap::{
     cid_prefix, reply_to_wantlist, BitswapMessage, BlockPayload, BlockPresence, Version, WantEntry,
