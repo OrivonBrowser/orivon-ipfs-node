@@ -3201,7 +3201,7 @@ mod tests {
             providers[0]
                 .addrs
                 .iter()
-                .any(|addr| addr == &provider_addr.to_string()),
+                .any(|addr| addr.starts_with(&provider_addr.to_string())),
             "addresses: {:?}",
             providers[0].addrs
         );

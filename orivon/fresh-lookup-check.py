@@ -35,6 +35,15 @@ import urllib.request
 
 ROUTERS = "https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1"
 METHODS = ["node-auto", "node-dht", "kubo-find", "kubo-cat", "delegated"]
+# `node-dht:wide` is node-dht with the environment of the preset named after the colon.
+PRESETS = {
+    "par10": {"ORIVON_IPFS_DHT_PARALLELISM": "10"},
+    "wide": {"ORIVON_IPFS_DHT_PARALLELISM": "10", "ORIVON_IPFS_DHT_CONNECTIONS": "64", "ORIVON_IPFS_DHT_PENDING_CONNECTIONS": "32"},
+    "fast": {
+        "ORIVON_IPFS_DHT_PARALLELISM": "10", "ORIVON_IPFS_DHT_CONNECTIONS": "64", "ORIVON_IPFS_DHT_PENDING_CONNECTIONS": "32",
+        "ORIVON_IPFS_DHT_CONNECT_TIMEOUT_MS": "5000", "ORIVON_IPFS_DHT_IDLE_TIMEOUT_MS": "5000",
+    },
+}
 LOCK = threading.Lock()
 RESULTS = []
 PROCS = []
@@ -181,13 +190,15 @@ class Rig:
     # Fetchers
 
     def fetch_node(self, method, index, share):
-        mode = "auto" if method == "node-auto" else "light-dht"
+        base, _, preset = method.partition(":")
+        mode = "auto" if base == "node-auto" else "light-dht"
+        env = dict(os.environ, **PRESETS[preset]) if preset else None
         port = free_port()
         argv = [self.args.node, "--addr", f"127.0.0.1:{port}", "--online", "--routing-mode", mode]
         if mode == "auto":
             argv += ["--delegated-router", ROUTERS]
-        argv += ["--db", os.path.join(self.tmp, f"{method}-{index}.db"), "--trace-filter", self.args.fetch_trace]
-        proc = Proc(f"{method}-{index:02d}", argv, self.out)
+        argv += ["--db", os.path.join(self.tmp, f"{method.replace(':', '-')}-{index}.db"), "--trace-filter", self.args.fetch_trace]
+        proc = Proc(f"{method.replace(':', '-')}-{index:02d}", argv, self.out, env=env)
         try:
             if not wait_for(f"http://127.0.0.1:{port}/health", 60):
                 return {"ok": False, "note": "fetch node did not start"}
@@ -366,10 +377,8 @@ class Rig:
         by_method = {}
         for r in RESULTS:
             by_method.setdefault(r["method"], []).append(r)
-        for method in METHODS:
-            rows = by_method.get(method)
-            if not rows:
-                continue
+        for method in sorted(by_method, key=lambda m: (METHODS.index(m.split(":")[0]), m)):
+            rows = by_method[method]
             ok = sorted(r["seconds"] for r in rows if r.get("ok"))
             fast = sum(1 for s in ok if s <= 15)
             median = ok[len(ok) // 2] if ok else None
